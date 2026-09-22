@@ -1,0 +1,17 @@
+[Unit]
+Description=MITOS audio management service
+After=sound.target
+Wants=sound.target
+
+[Service]
+Type=simple
+ExecStart=/usr/lib/mitos/mitos-audio
+Environment=RUST_LOG=info
+RuntimeDirectory=mitos
+RuntimeDirectoryMode=0755
+Restart=on-failure
+RestartSec=2
+SupplementaryGroups=audio
+
+[Install]
+WantedBy=default.target
