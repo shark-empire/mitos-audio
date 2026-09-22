@@ -6,6 +6,7 @@ use crate::errors::AudioError;
 #[serde(default)]
 pub struct AudioConfig {
     pub socket_path: String,
+    pub backend: String,
     pub default_sample_rate: u32,
     pub default_channels: u32,
     pub volume_step: u32,
@@ -17,11 +18,13 @@ impl Default for AudioConfig {
     fn default() -> Self {
         Self {
             socket_path: "/run/mitos/audio.sock".to_string(),
+            backend: "auto".to_string(),
             default_sample_rate: 48000,
             default_channels: 2,
             volume_step: 5,
             max_volume: 100,
             log_level: "info".to_string(),
+        
         }
     }
 }
