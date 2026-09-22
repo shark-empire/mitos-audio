@@ -1,10 +1,26 @@
 use std::sync::{Mutex, MutexGuard};
 
+use super::backend::OutputDevice;
+use crate::engine::MIX_CHANNELS;
 use super::backend::AudioBackend;
 use crate::devices::device::{Bus, Device, DeviceKind, Direction};
 use crate::errors::AudioError;
 use crate::monitoring::LevelFrame;
 
+/// Playback black hole for demo mode. The mixer thread still runs and
+/// meters the *mixed* signal, so GUIs see real levels; samples are
+/// discarded. This makes the whole audio plane testable without hardware.
+pub struct DemoOutput;
+
+impl OutputDevice for DemoOutput {
+    fn write(&mut self, frames: &[f32]) -> Result<usize, AudioError> {
+        Ok(frames.len() / MIX_CHANNELS)
+    }
+
+    fn recover(&mut self) -> Result<(), AudioError> {
+        Ok(())
+    }
+}
 /// In-memory "hardware" for development, CI, and non-Linux builds.
 ///
 /// Behaves like real hardware: volume/mute writes persist and are
@@ -53,6 +69,10 @@ impl AudioBackend for DemoBackend {
 
     fn scan(&self) -> Result<Vec<Device>, AudioError> {
         Ok(guard(&self.devices)?.clone())
+    }
+    
+    fn open_output(&self, _device: &Device) -> Result<Box<dyn OutputDevice>, AudioError> {
+        Ok(Box::new(DemoOutput))
     }
 
     fn set_volume(&self, device: &Device, volume: u32) -> Result<bool, AudioError> {
