@@ -13,3 +13,6 @@ pub mod manager;
 pub mod streams;
 pub mod volume;
 pub mod backend;   // ← add this
+pub mod monitoring;
+pub mod persistence;
+pub mod routing;
