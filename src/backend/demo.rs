@@ -63,6 +63,7 @@ impl AudioBackend for DemoBackend {
         }
         Ok(false)
     }
+    
 
     fn set_mute(&self, device: &Device, mute: bool) -> Result<bool, AudioError> {
         for d in guard(&self.devices)?.iter_mut() {
@@ -72,5 +73,34 @@ impl AudioBackend for DemoBackend {
             }
         }
         Ok(false)
+    }
+    
+       fn levels(&self) -> Result<LevelFrame, AudioError> {
+        let t = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs_f64())
+            .unwrap_or(0.0);
+        let guard = guard(&self.devices)?;
+        let (volume, muted) = guard
+            .iter()
+            .find(|d| d.id == "speakers")
+            .map(|d| (d.volume, d.muted))
+            .unwrap_or((0, false));
+
+        let output_level = if muted {
+            0.0
+        } else {
+            let wave = 0.5 + 0.5 * (t * std::f64::consts::TAU * 1.1).sin();
+            (0.30 + 0.55 * wave) as f32 * volume as f32 / 100.0
+        };
+        let input_level = (0.12 + 0.10 * (t * std::f64::consts::TAU * 0.7).sin()) as f32;
+        let peak = (output_level * 1.05).min(1.0);
+
+        Ok(LevelFrame {
+            output_level,
+            input_level,
+            peak,
+            clipping: peak >= 0.99,
+        })
     }
 }
