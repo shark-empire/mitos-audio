@@ -25,6 +25,8 @@ pub mod error;
 pub mod events;
 pub mod types;
 
+mod levels;
+pub use levels::LevelStream;
 pub use client::{AudioClient, ClientConfig};
 pub use error::ClientError;
 pub use events::{ClientEvent, EventStream};
