@@ -10,27 +10,60 @@
 use std::collections::HashMap;
 use std::fs;
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use alsa::mixer::{Mixer, Selem, SelemChannelId, SelemId};
 
 use super::backend::AudioBackend;
 use crate::devices::device::{Bus, Device, DeviceKind, Direction};
 use crate::errors::AudioError;
+use crate::monitoring::LevelFrame;
 
 /// Mixer control names tried, in order, when looking for a volume control.
 const OUTPUT_CONTROLS: &[&str] = &["Master", "Headphone", "Headphones", "Speaker", "PCM"];
 const INPUT_CONTROLS: &[&str] = &["Capture", "Input", "Mic", "Internal Mic", "Headset Mic"];
 
-pub struct AlsaBackend;
+#[derive(Default)]
+struct MeterShared {
+    level: f32,
+    peak: f32,
+    clipping: bool,
+}
+
+pub struct AlsaBackend {
+    meter: Arc<Mutex<MeterShared>>,
+    meter_active: Arc<AtomicBool>,
+    capture_metering: bool,
+    meter_thread_started: AtomicBool,
+}
+
 
 impl AlsaBackend {
-    pub fn new() -> Result<Self, AudioError> {
+    pub fn new(capture_metering: bool) -> Result<Self, AudioError> {
         if !Path::new("/proc/asound").exists() {
             return Err(AudioError::Backend(
                 "ALSA is not available (/proc/asound not found)".into(),
             ));
         }
-        Ok(Self)
+        Ok(Self {
+            meter: Arc::new(Mutex::new(MeterShared::default())),
+            meter_active: Arc::new(AtomicBool::new(false)),
+            capture_metering,
+            meter_thread_started: AtomicBool::new(false),
+        })
+    }
+
+    fn ensure_capture_meter(&self) {
+        if !self.capture_metering {
+            return;
+        }
+        if self.meter_thread_started.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        tracing::debug!("starting capture level metering on 'default'");
+        spawn_capture_meter(self.meter.clone(), self.meter_active.clone());
     }
 }
 
@@ -281,6 +314,27 @@ impl AudioBackend for AlsaBackend {
 
         Ok(devices)
     }
+    
+    fn levels(&self) -> Result<LevelFrame, AudioError> {
+        self.ensure_capture_meter();
+        let m = self
+            .meter
+            .lock()
+            .map_err(|_| AudioError::Backend("meter state poisoned"))?;
+        Ok(LevelFrame {
+            output_level: 0.0,
+            input_level: m.level,
+            peak: m.peak,
+            clipping: m.clipping,
+        })
+    }
+
+    fn set_metering_active(&self, active: bool) {
+        self.meter_active.store(active, Ordering::Relaxed);
+        if active {
+            self.ensure_capture_meter();
+        }
+    }
 
     fn set_volume(&self, device: &Device, volume: u32) -> Result<bool, AudioError> {
         let Some(alsa_id) = &device.alsa else { return Ok(false) };
@@ -321,5 +375,68 @@ impl AudioBackend for AlsaBackend {
                 .map_err(|e| AudioError::Backend(format!("set_capture_switch_all: {e}")))?;
         }
         Ok(true)
+    }
+    // ─── capture metering thread (module level) ─────────────────────────────
+
+fn spawn_capture_meter(shared: Arc<Mutex<MeterShared>>, active: Arc<AtomicBool>) {
+    std::thread::Builder::new()
+        .name("mitos-audio-capture-meter".into())
+        .spawn(move || loop {
+            if !active.load(Ordering::Relaxed) {
+                std::thread::sleep(Duration::from_millis(250));
+                continue;
+            }
+            if let Err(e) = run_capture_meter(&shared, &active) {
+                tracing::debug!(error = %e, "capture meter stopped; retrying");
+                std::thread::sleep(Duration::from_secs(1));
+            }
+        })
+        .expect("cannot spawn capture meter thread");
+}
+
+/// Opens `default` for capture (shareable via dsnoop on most distros) and
+/// computes RMS/peak on 100 ms chunks. Returns when metering is parked or
+/// the PCM errors (caller reopens with backoff).
+fn run_capture_meter(shared: &Arc<Mutex<MeterShared>>, active: &AtomicBool) -> Result<(), String> {
+    let pcm = alsa::pcm::PCM::new("default", alsa::Direction::Capture, false)
+        .map_err(|e| format!("open default capture: {e}"))?;
+    pcm.set_params(
+        alsa::pcm::Format::S16_LE,
+        alsa::pcm::Access::RWInterleaved,
+        1,      // mono is enough for metering
+        48_000, // rate
+        1,      // allow resample
+        100_000, // ~100 ms latency → responsive park/unpark
+    )
+    .map_err(|e| format!("set_params: {e}"))?;
+    let io = pcm.io::<i16>().map_err(|e| format!("io: {e}"))?;
+
+    let mut buf = vec![0i16; 4800]; // 100 ms @ 48 kHz mono
+    loop {
+        if !active.load(Ordering::Relaxed) {
+            tracing::debug!("capture meter parked (no level subscribers)");
+            return Ok(());
+        }
+        match io.readi(&mut buf) {
+            Ok(frames) => {
+                let n = frames.min(buf.len());
+                let mut peak = 0.0f32;
+                let mut sum_sq = 0.0f64;
+                for &sample in &buf[..n] {
+                    let v = f32::from(sample).abs() / 32768.0;
+                    if v > peak {
+                        peak = v;
+                    }
+                    sum_sq += f64::from(v * v);
+                }
+                let rms = if n > 0 { (sum_sq / n as f64).sqrt() as f32 } else { 0.0 };
+                if let Ok(mut m) = shared.lock() {
+                    m.level = m.level * 0.6 + rms * 0.4; // smoothed RMS
+                    m.peak = peak.max(m.peak * 0.85); // decaying peak
+                    m.clipping = peak >= 0.98;
+                }
+            }
+            Err(e) => return Err(format!("readi: {e}")),
+        }
     }
 }
