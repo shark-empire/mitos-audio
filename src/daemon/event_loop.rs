@@ -13,7 +13,34 @@ use crate::manager::state::AudioManager;
 
 pub async fn run(config: AudioConfig) -> Result<(), AudioError> {
     let (event_tx, _) = tokio::sync::broadcast::channel(256);
-    let manager = Arc::new(AudioManager::new(config.clone(), event_tx));
+
+    // Backend selection: real ALSA when available, demo otherwise.
+    let backend = crate::backend::create_backend(&config)?;
+    tracing::info!(backend = backend.name(), "audio backend selected");
+
+    let manager = Arc::new(AudioManager::new(config.clone(), backend, event_tx));
+
+    // Initial device scan (non-fatal: the poller below keeps retrying).
+    if let Err(e) = manager.refresh().await {
+        tracing::error!(error = %e, "initial device scan failed (continuing)");
+    }
+
+    // Hotplug / external-change poller.
+    // v0.2 polls every 3 s; a udev-based watcher replaces this later (roadmap).
+    {
+        let manager = manager.clone();
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(std::time::Duration::from_secs(3));
+            tick.tick().await; // consume the immediate first tick
+            loop {
+                tick.tick().await;
+                if let Err(e) = manager.refresh().await {
+                    tracing::debug!(error = %e, "periodic rescan failed");
+                }
+            }
+        });
+    }
+
     let permissions = Arc::new(Permissions::current());
 
     let socket = std::path::Path::new(&config.socket_path);
