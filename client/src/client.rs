@@ -67,6 +67,58 @@ impl AudioClient {
     pub fn socket_path(&self) -> &std::path::Path {
         &self.config.socket_path
     }
+    
+        // ── levels (dedicated 10 Hz subscription) ───────────────────────────
+
+    /// Live level meters. Never fails — the monitor reconnects with
+    /// backoff forever. Frames only arrive while this stream is alive
+    /// (the daemon parks hardware metering when nobody listens).
+    pub fn subscribe_levels(&self) -> crate::LevelStream {
+        let (tx, rx) = tokio::sync::mpsc::channel(64);
+        let config = self.config.clone();
+        tokio::spawn(crate::levels::level_monitor(config, tx));
+        crate::LevelStream { rx }
+    }
+
+    // ── streams (interim application registration) ──────────────────────
+
+    pub async fn create_stream(
+        &self,
+        application: &str,
+        device: Option<&str>,
+        kind: Option<&str>,
+    ) -> Result<crate::types::StreamInfo, ClientError> {
+        #[derive(serde::Deserialize)]
+        struct Wrapper {
+            stream: crate::types::StreamInfo,
+        }
+        let mut params = json!({ "application": application });
+        if let Some(d) = device {
+            params["device"] = json!(d);
+        }
+        if let Some(k) = kind {
+            params["kind"] = json!(k);
+        }
+        let wrapper: Wrapper = self.typed("CreateStream", params).await?;
+        Ok(wrapper.stream)
+    }
+
+    pub async fn destroy_stream(&self, stream_id: &str) -> Result<(), ClientError> {
+        self.call("DestroyStream", json!({ "stream_id": stream_id })).await?;
+        Ok(())
+    }
+
+    // ── routing ─────────────────────────────────────────────────────────
+
+    /// Re-read the daemon's routing.toml; returns the rule count.
+    pub async fn reload_routing(&self) -> Result<usize, ClientError> {
+        #[derive(serde::Deserialize)]
+        struct Wrapper {
+            rules: usize,
+        }
+        let wrapper: Wrapper = self.typed("ReloadRouting", json!({})).await?;
+        Ok(wrapper.rules)
+    }
 
     // ── plumbing ────────────────────────────────────────────────────────
 
