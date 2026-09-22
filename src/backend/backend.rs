@@ -2,6 +2,17 @@ use crate::devices::device::Device;
 use crate::errors::AudioError;
 use crate::monitoring::LevelFrame;
 
+/// One opened output device (the playback half of a backend). `write`
+/// takes interleaved stereo f32 at the canonical mix rate (48 kHz);
+/// implementations convert to the device's native format.
+pub trait OutputDevice: Send {
+    /// Write as many whole frames as the device accepts; returns frames written.
+    fn write(&mut self, frames: &[f32]) -> Result<usize, AudioError>;
+
+    /// Recover after underrun/suspend (ALSA `prepare`).
+    fn recover(&mut self) -> Result<(), AudioError>;
+}
+
 /// Hardware-facing interface. Implementations must be `Send + Sync`;
 /// they are invoked through `tokio::task::spawn_blocking`.
 ///
@@ -10,8 +21,9 @@ use crate::monitoring::LevelFrame;
 ///   current hardware volume/mute.
 /// - `set_volume`/`set_mute` return `Ok(false)` when the device has no
 ///   such hardware control (soft-fail, not an error).
-/// - `levels` is only called while level subscribers exist; backends may
-///   park hardware (close capture PCMs) when `set_metering_active(false)`.
+/// - `open_output` is called by the sink manager when a device has
+///   streams routed to it; returned devices are written to from a
+///   dedicated mixer thread.
 pub trait AudioBackend: Send + Sync {
     fn name(&self) -> &'static str;
 
@@ -21,7 +33,13 @@ pub trait AudioBackend: Send + Sync {
 
     fn set_mute(&self, device: &Device, mute: bool) -> Result<bool, AudioError>;
 
-    /// Current level frame. Default: zeros (backend without metering).
+    /// Open `device` for playback (audio plane). Default: unsupported.
+    fn open_output(&self, _device: &Device) -> Result<Box<dyn OutputDevice>, AudioError> {
+        Err(AudioError::Backend("backend has no playback support".into()))
+    }
+
+    /// Current level frame (input side; output is measured by the mixer).
+    /// Default: zeros.
     fn levels(&self) -> Result<LevelFrame, AudioError> {
         Ok(LevelFrame::default())
     }
