@@ -69,6 +69,10 @@ Hotplug: udev watcher (subsystem sound) → debounced instant rescan,plus the pe
 
 And append a "v0.2 semantics" block:
 
+Audio plane live: GetState now includes "data_socket"; streamentries carry follows_default, live, buffered_ms, underrun_periods.Real streams are created/closed via the data plane (docs/audio-plane.md);CreateStream remains as silent placeholder registration for routing tests.
+SetStreamVolume/SetStreamMute/MoveStream now affect live audiowithin one mixer period (~12.5 ms).
+Connections (control and data) are permitted for root, the daemon uid,and members of the mitos-audio group
+
 v0.2 semantics
 
 Master volume = the default output device's volume. GetVolume /SetVolume / Mute / Unmute without a device parameter resolve tothe current default output; results and VolumeChanged events carry its id.
