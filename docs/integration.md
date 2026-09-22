@@ -78,6 +78,7 @@ GetState returns "version" — check it, don't parse it strictly.
 
 Meters → use the dedicated levels subscription: subscribe_levels()in libmitos-audio (or SubscribeLevels over the raw socket). The daemonpushes LevelChanged frames at ~10 Hz only while at least one levelsubscriber exists — close the stream when the meter widget is hiddenand hardware capture metering parks automatically. No polling needed.
 
+Audio plane: implemented — applications deliver PCM over the datasocket (see docs/audio-plane.md); in Rust useAudioClient::open_playback(). A PulseAudio/PipeWire compatibility shimremains future work for unmodified third-party apps
 4. Rust clients — use libmitos-audio (recommended)
 
 The repository ships a typed client crate (client/, package namelibmitos-audio). It implements the entire IPC surface with reconnecthandling baked in — this is what mitos-gui and mitos-settings should useinstead of hand-rolled sockets:
