@@ -1,0 +1,14 @@
+# mitos-audio configuration — /etc/mitos/audio.toml
+
+# Unix domain socket exposed to clients (mitos-gui, mitos-settings, apps, CLI)
+socket_path = "/run/mitos/audio.sock"
+
+# Defaults applied to new streams
+default_sample_rate = 48000
+default_channels = 2
+
+# Volume behaviour
+volume_step = 5     # percent per step (media keys)
+max_volume = 100    # hard ceiling for SetVolume
+
+log_level = "info"
