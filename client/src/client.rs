@@ -55,6 +55,40 @@ impl AudioClient {
         Ok(client)
     }
 
+    // ── playback (audio plane) ──────────────────────────────────────────
+
+    /// Open a playback stream — 48 kHz stereo s16, the common case.
+    /// The stream appears in `streams`, fires routing rules, and follows
+    /// the default output until explicitly moved.
+    pub async fn open_playback(
+        &self,
+        application: &str,
+    ) -> Result<crate::playback::PlaybackStream, ClientError> {
+        self.open_playback_opts(application, 48_000, 2, "s16le").await
+    }
+
+    pub async fn open_playback_opts(
+        &self,
+        application: &str,
+        sample_rate: u32,
+        channels: u16,
+        format: &str,
+    ) -> Result<crate::playback::PlaybackStream, ClientError> {
+        let data_socket = self.resolve_data_socket().await?;
+        crate::playback::PlaybackStream::open(&data_socket, application, sample_rate, channels, format).await
+    }
+
+    async fn resolve_data_socket(&self) -> Result<String, ClientError> {
+        if let Ok(path) = std::env::var("MITOS_AUDIO_DATA_SOCK") {
+            return Ok(path);
+        }
+        if let Ok(state) = self.get_state().await {
+            if let Some(path) = state.data_socket {
+                return Ok(path);
+            }
+        }
+        Ok(derive_data_socket(&self.config.socket_path.to_string_lossy()))
+    }
     /// Lazy client — connects on first use (and reconnects as needed).
     pub fn new() -> Self {
         Self::with_config(ClientConfig::default())
@@ -333,5 +367,12 @@ async fn monitor(config: ClientConfig, tx: mpsc::Sender<ClientEvent>) {
         }
         tokio::time::sleep(backoff).await;
         backoff = (backoff * 2).min(config.retry_max);
+    }
+}
+
+fn derive_data_socket(control: &str) -> String {
+    match control.strip_suffix(".sock") {
+        Some(stem) => format!("{stem}-data.sock"),
+        None => format!("{control}-data"),
     }
 }
