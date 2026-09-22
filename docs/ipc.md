@@ -43,6 +43,10 @@ MuteMicrophone	mute	{ muted }
 GetLevels	–	{ master_volume, muted, output_level, input_level, peak, clipping }
 SubscribeEvents	–	{ subscribed: true } then event lines
 Example session
+| Command | Params | Result |
+|---------|--------|--------|
+| `Rescan` | – | `{ devices: [...], default_output, default_input }` — forces a hardware rescan (also automatic every ~3 s) |
+
 
 → {"id":1,"command":"GetState","params":{}}← {"id":1,"ok":true,"result":{"service":"mitos-audio","version":"0.1.0", ... }}→ {"id":2,"command":"SetVolume","params":{"volume":60}}← {"id":2,"ok":true,"result":{"volume":60}}   (all subscribers also receive: {"event":"VolumeChanged","data":{"device":null,"volume":60}})→ {"id":3,"command":"MoveStream","params":{"stream_id":"s-1","device_id":"headphones"}}← {"id":3,"ok":true,"result":{"stream_id":"s-1","device":"headphones"}}
 Events
