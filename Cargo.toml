@@ -1,12 +1,19 @@
+[workspace]
+members = ["client"]
+
 [package]
 name = "mitos-audio"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 description = "MITOS system audio management service (user-facing layer above ALSA)"
 license = "MIT"
 
+[features]
+default = ["alsa-backend"]
+alsa-backend = ["alsa"]
+
 [dependencies]
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "sync"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "sync", "time"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 toml = "0.8"
@@ -14,3 +21,4 @@ thiserror = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 clap = { version = "4", features = ["derive"] }
+alsa = { version = "0.9", optional = true }
