@@ -58,6 +58,7 @@ enum Cmd {
     Monitor,
     /// Check the daemon is alive
     Ping,
+    Rescan,
 }
 
 #[tokio::main]
@@ -66,10 +67,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let sock = cli.socket.clone();
 
     match cli.command {
+        
         Cmd::Devices => { let res = call(&sock, "ListDevices", json!({})).await?; print_devices(&res, None)?; }
         Cmd::Outputs => { let res = call(&sock, "ListDevices", json!({})).await?; print_devices(&res, Some(Direction::Output))?; }
         Cmd::Inputs  => { let res = call(&sock, "ListDevices", json!({})).await?; print_devices(&res, Some(Direction::Input))?; }
 
+        Cmd::Rescan => {
+        let res = call(&sock, "Rescan", json!({})).await?;
+        print_devices(&res, None)?;
+          }
         Cmd::Output { id } => match id {
             None => { let res = call(&sock, "GetDefaults", json!({})).await?;
                       println!("default output: {}", res["default_output"].as_str().unwrap_or("(none)")); }
