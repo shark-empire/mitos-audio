@@ -37,6 +37,7 @@ pub enum Command {
     MuteMicrophone { mute: bool },
     GetLevels,
     SubscribeEvents,
+    Rescan,
 }
 
 impl Request {
@@ -68,6 +69,7 @@ impl Request {
             "SetDefaultOutput" => Command::SetDefaultOutput { id: req(&self.params, "id")? },
             "SetDefaultInput" => Command::SetDefaultInput { id: req(&self.params, "id")? },
             "GetVolume" => Command::GetVolume { device: opt(&self.params, "device")? },
+            "Rescan" => Command::Rescan,
             "SetVolume" => Command::SetVolume {
                 device: opt(&self.params, "device")?,
                 volume: req(&self.params, "volume")?,
