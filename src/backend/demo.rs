@@ -3,6 +3,7 @@ use std::sync::{Mutex, MutexGuard};
 use super::backend::AudioBackend;
 use crate::devices::device::{Bus, Device, DeviceKind, Direction};
 use crate::errors::AudioError;
+use crate::monitoring::LevelFrame;
 
 /// In-memory "hardware" for development, CI, and non-Linux builds.
 ///
