@@ -38,6 +38,10 @@ pub enum Command {
     GetLevels,
     SubscribeEvents,
     Rescan,
+    SubscribeLevels,
+    CreateStream { application: String, device: Option<String>, kind: Option<String> },
+    DestroyStream { stream_id: String },
+    ReloadRouting,
 }
 
 impl Request {
@@ -89,6 +93,23 @@ impl Request {
                 stream_id: req(&self.params, "stream_id")?,
                 device_id: req(&self.params, "device_id")?,
             },
+                "SubscribeLevels" => Command::SubscribeLevels,
+    "CreateStream" => Command::CreateStream {
+        application: req(&self.params, "application")?,
+        device: opt(&self.params, "device")?,
+        kind: opt(&self.params, "kind")?,
+    },
+    "DestroyStream" => Command::DestroyStream { stream_id: req(&self.params, "stream_id")? },
+    "ReloadRouting" => Command::ReloadRouting,
+
+// add to enum Event (sent ONLY on the dedicated levels channel):
+    /// Pushed at ~10 Hz to level subscribers while any exist.
+    LevelChanged {
+        output_level: f32,
+        input_level: f32,
+        peak: f32,
+        clipping: bool,
+    },
             "ListProfiles" => Command::ListProfiles,
             "SetProfile" => Command::SetProfile { profile: req(&self.params, "profile")? },
             "GetMicrophone" => Command::GetMicrophone,
