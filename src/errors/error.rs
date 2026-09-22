@@ -32,6 +32,15 @@ pub enum AudioError {
 
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
+    
+    #[error("no output device available")]
+    NoOutput,
+    
+    #[error("no input device available")]
+    NoInput,
+    
+    #[error("audio backend error: {0}")]
+    Backend(String),
 
     #[error("serialization error: {0}")]
     Serialization(#[from] serde_json::Error),
@@ -50,6 +59,9 @@ impl AudioError {
             Self::Ipc(_) => "ipc-error",
             Self::Config(_) => "config-error",
             Self::ConfigParse(_) => "config-parse-error",
+            Self::NoOutput => "no-output-device",
+            Self::NoInput => "no-input-device",
+            Self::Backend(_) => "backend-error",
             Self::Io(_) => "io-error",
             Self::Serialization(_) => "serialization-error",
         }
