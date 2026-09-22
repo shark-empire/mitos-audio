@@ -1,0 +1,39 @@
+# mitos-audio routing rules — /etc/mitos/routing.toml
+# Full language reference: docs/routing.md
+# Reload after editing:  mitos-audioctl reload-routing
+
+# The classic case: a Bluetooth headset takes over when it connects …
+[[rule]]
+name = "bluetooth-headset-priority"
+when = "device-added"
+match = { kind = "headset", bus = "bluetooth" }
+
+[[rule.action]]
+type = "set-default-output"
+target = "trigger"     # the device that triggered the rule
+remember = true        # save the previous default for restore
+
+[[rule.action]]
+type = "set-profile"
+profile = "bluetooth-headset"
+
+# … and the previous output is restored when it disconnects.
+[[rule]]
+name = "bluetooth-headset-restore"
+when = "device-removed"
+match = { kind = "headset", bus = "bluetooth" }
+
+[[rule.action]]
+type = "restore-output"
+
+# Example: application-specific routing (uncomment and adjust the device id
+# — see `mitos-audioctl devices`). Fires when an app registers a stream.
+#
+# [[rule]]
+# name = "games-to-headphones"
+# when = "stream-added"
+# match = { application = "*game*" }
+#
+# [[rule.action]]
+# type = "move-stream"
+# to = "headphones"
