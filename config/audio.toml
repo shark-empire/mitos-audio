@@ -1,14 +1,24 @@
 # mitos-audio configuration — /etc/mitos/audio.toml
 
-# Unix domain socket exposed to clients (mitos-gui, mitos-settings, apps, CLI)
 socket_path = "/run/mitos/audio.sock"
-
-# Defaults applied to new streams
+backend = "auto"          # "auto" | "alsa" | "demo"
 default_sample_rate = 48000
 default_channels = 2
-
-# Volume behaviour
-volume_step = 5     # percent per step (media keys)
-max_volume = 100    # hard ceiling for SetVolume
-
+volume_step = 5
+max_volume = 100
 log_level = "info"
+
+# Persistence: defaults, per-device volumes, profile, mic, routing memory
+# survive restarts. Written atomically with a 400 ms debounce.
+persist = true
+state_path = "/var/lib/mitos/audio/state.json"
+routing_path = "/etc/mitos/routing.toml"
+
+[hotplug]
+udev = true       # instant hotplug via udev (built with `udev-hotplug`)
+poll_secs = 3     # periodic rescan: safety net + external mixer changes (0 = off)
+
+[metering]
+enabled = true
+interval_ms = 100           # LevelChanged push rate (clamped 20–1000)
+capture_input = true        # meter `default` capture PCM on real ALSA
