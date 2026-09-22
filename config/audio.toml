@@ -13,6 +13,9 @@ log_level = "info"
 persist = true
 state_path = "/var/lib/mitos/audio/state.json"
 routing_path = "/etc/mitos/routing.toml"
+# Audio plane
+data_socket_path = "/run/mitos/audio-data.sock"   # derived from socket_path when unset in dev
+playback_latency_ms = 50                          # per-sink ALSA buffer latency
 
 [hotplug]
 udev = true       # instant hotplug via udev (built with `udev-hotplug`)
