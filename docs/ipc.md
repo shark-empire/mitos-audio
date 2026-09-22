@@ -48,6 +48,15 @@ Example session
 | `Rescan` | – | `{ devices: [...], default_output, default_input }` — forces a hardware rescan (also automatic every ~3 s) |
 
 
+
+And append a "v0.2 semantics" block:
+
+v0.2 semantics
+
+Master volume = the default output device's volume. GetVolume /SetVolume / Mute / Unmute without a device parameter resolve tothe current default output; results and VolumeChanged events carry its id.
+SetVolume / mute results include hw_applied (bool) — false when thedevice has no hardware volume control / mute switch (state still tracked).
+The daemon rescans hardware every ~3 s and on Rescan. External changes(e.g. alsamixer, USB hotplug) surface as DeviceChanged /DeviceAdded / DeviceRemoved events.
+GetState now includes "backend": "alsa" or "demo".
 → {"id":1,"command":"GetState","params":{}}← {"id":1,"ok":true,"result":{"service":"mitos-audio","version":"0.1.0", ... }}→ {"id":2,"command":"SetVolume","params":{"volume":60}}← {"id":2,"ok":true,"result":{"volume":60}}   (all subscribers also receive: {"event":"VolumeChanged","data":{"device":null,"volume":60}})→ {"id":3,"command":"MoveStream","params":{"stream_id":"s-1","device_id":"headphones"}}← {"id":3,"ok":true,"result":{"stream_id":"s-1","device":"headphones"}}
 Events
 
