@@ -15,7 +15,8 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use alsa::mixer::{Mixer, Selem, SelemChannelId, SelemId};
-
+use crate::engine::MIX_RATE;
+use super::backend::OutputDevice;
 use super::backend::AudioBackend;
 use crate::devices::device::{Bus, Device, DeviceKind, Direction};
 use crate::errors::AudioError;
@@ -37,11 +38,12 @@ pub struct AlsaBackend {
     meter_active: Arc<AtomicBool>,
     capture_metering: bool,
     meter_thread_started: AtomicBool,
+    latency_us: u32,
 }
 
 
 impl AlsaBackend {
-    pub fn new(capture_metering: bool) -> Result<Self, AudioError> {
+    pub fn new(capture_metering: bool, latency_us: u32) -> Result<Self, AudioError> {
         if !Path::new("/proc/asound").exists() {
             return Err(AudioError::Backend(
                 "ALSA is not available (/proc/asound not found)".into(),
@@ -52,6 +54,7 @@ impl AlsaBackend {
             meter_active: Arc::new(AtomicBool::new(false)),
             capture_metering,
             meter_thread_started: AtomicBool::new(false),
+            latency_us,
         })
     }
 
@@ -315,6 +318,10 @@ impl AudioBackend for AlsaBackend {
         Ok(devices)
     }
     
+    fn open_output(&self, device: &Device) -> Result<Box<dyn OutputDevice>, AudioError> {
+        Ok(Box::new(AlsaOutput::open(device, self.latency_us)?))
+    }
+    
     fn levels(&self) -> Result<LevelFrame, AudioError> {
         self.ensure_capture_meter();
         let m = self
@@ -439,4 +446,63 @@ fn run_capture_meter(shared: &Arc<Mutex<MeterShared>>, active: &AtomicBool) -> R
             Err(e) => return Err(format!("readi: {e}")),
         }
     }
+}
+
+pub struct AlsaOutput {
+    pcm: alsa::pcm::PCM,
+    id: String,
+}
+
+impl AlsaOutput {
+    /// Opens `plughw:X,Y` (ALSA handles format/rate conversion), stereo,
+    /// S16 at the canonical mix rate.
+    pub fn open(device: &Device, latency_us: u32) -> Result<Self, AudioError> {
+        let hw = device
+            .alsa
+            .as_deref()
+            .ok_or_else(|| AudioError::Backend(format!("device {} has no ALSA id", device.id)))?;
+        let plug = match hw.strip_prefix("hw:") {
+            Some(rest) => format!("plughw:{rest}"),
+            None => hw.to_string(),
+        };
+        let pcm = alsa::pcm::PCM::new(&plug, alsa::Direction::Playback, false)
+            .map_err(|e| AudioError::Backend(format!("open {plug}: {e}")))?;
+        pcm.set_params(
+            alsa::pcm::Format::S16LE,
+            alsa::pcm::Access::RWInterleaved,
+            crate::engine::MIX_CHANNELS as u32,
+            MIX_RATE,
+            1,
+            latency_us,
+        )
+        .map_err(|e| AudioError::Backend(format!("set_params {plug}: {e}")))?;
+        Ok(Self { pcm, id: plug })
+    }
+}
+
+impl OutputDevice for AlsaOutput {
+    fn write(&mut self, frames: &[f32]) -> Result<usize, AudioError> {
+        let s16: Vec<i16> =
+            frames.iter().map(|&s| (s.clamp(-1.0, 1.0) * 32767.0) as i16).collect();
+        // `io()` borrows the PCM — construct per call (self-referential workaround).
+        let io = self.pcm.io::<i16>().map_err(|e| AudioError::Backend(format!("io: {e}")))?;
+        match io.writei(&s16) {
+            Ok(n) => Ok(n),
+            Err(e) if is_recoverable(&e) => {
+                self.recover()?;
+                let io = self.pcm.io::<i16>().map_err(|e| AudioError::Backend(format!("io: {e}")))?;
+                io.writei(&s16).map_err(|e| AudioError::Backend(format!("writei {}: {e}", self.id)))
+            }
+            Err(e) => Err(AudioError::Backend(format!("writei {}: {e}", self.id))),
+        }
+    }
+
+    fn recover(&mut self) -> Result<(), AudioError> {
+        self.pcm.prepare().map_err(|e| AudioError::Backend(format!("prepare {}: {e}", self.id)))
+    }
+}
+
+/// EPIPE (underrun) / ESTRPIPE (suspend) — recoverable via `prepare`.
+fn is_recoverable(e: &alsa::Error) -> bool {
+    matches!(e.errno(), Some(32) | Some(-32) | Some(86) | Some(-86))
 }
