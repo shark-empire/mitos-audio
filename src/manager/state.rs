@@ -8,6 +8,9 @@ use tokio::sync::{broadcast, Mutex};
 use crate::backend::AudioBackend;
 use crate::config::AudioConfig;
 use crate::devices::device::{Device, DeviceKind, DeviceState, Direction};
+use crate::engine::convert::StreamFormat;
+use crate::engine::sink::SinkManager;
+use crate::engine::{LiveStream, OutputLevels, StreamHub};
 use crate::errors::AudioError;
 use crate::ipc::messages::{Command, Event};
 use crate::monitoring::LevelFrame;
@@ -20,11 +23,9 @@ const KNOWN_PROFILES: &[&str] = &[
     "surround-7.1", "bluetooth-music", "bluetooth-headset", "usb-dac",
 ];
 
-/// Central audio state, command dispatch, routing execution and persistence.
-///
-/// The backend owns *hardware truth*; the manager owns policy (defaults,
-/// profiles, mic, routing) and is the only component that touches the
-/// backend or the persistent store.
+/// Central audio state, command dispatch, routing execution, persistence,
+/// and the live-stream registry. The backend owns *hardware truth*; the
+/// manager owns policy; the hub + sinks own the audio path.
 pub struct AudioManager {
     config: AudioConfig,
     backend: Arc<dyn AudioBackend>,
@@ -33,6 +34,9 @@ pub struct AudioManager {
     events: broadcast::Sender<Event>,
     routing: RoutingEngine,
     store: Option<SettingsStore>,
+    hub: Arc<StreamHub>,
+    sinks: Arc<SinkManager>,
+    out_levels: Arc<OutputLevels>,
     last_levels: Mutex<LevelFrame>,
     next_stream_id: AtomicU64,
 }
@@ -55,9 +59,14 @@ impl AudioManager {
         store: Option<SettingsStore>,
     ) -> Self {
         let routing = RoutingEngine::load(&config.routing_path);
+        let hub = Arc::new(StreamHub::new());
+        let out_levels = Arc::new(OutputLevels::new());
+        let sinks = Arc::new(SinkManager::new(hub.clone(), backend.clone(), out_levels.clone()));
 
         let mut streams = HashMap::new();
         if backend.name() == "demo" {
+            // Silent placeholder so demo `streams` isn't empty; the audio
+            // plane creates real streams via the data socket.
             streams.insert(
                 "demo-1".to_string(),
                 AudioStream::new("demo-1", "mitos-music", StreamKind::Playback, "speakers"),
@@ -69,6 +78,9 @@ impl AudioManager {
             backend,
             routing,
             store,
+            hub,
+            sinks,
+            out_levels,
             state: Mutex::new(AudioState {
                 devices: HashMap::new(),
                 streams,
@@ -85,6 +97,8 @@ impl AudioManager {
         }
     }
 
+    // ── accessors for the daemon ──────────────────────────────────────
+
     pub fn subscribe(&self) -> broadcast::Receiver<Event> {
         self.events.subscribe()
     }
@@ -93,18 +107,151 @@ impl AudioManager {
         &self.routing
     }
 
-    fn emit(&self, event: Event) {
-        let _ = self.events.send(event);
+    pub fn sinks(&self) -> Arc<SinkManager> {
+        Arc::clone(&self.sinks)
     }
 
-    /// Last measured level frame (updated by the daemon's meter task).
+    pub fn output_levels(&self) -> Arc<OutputLevels> {
+        Arc::clone(&self.out_levels)
+    }
+
+    pub async fn devices_snapshot(&self) -> HashMap<String, Device> {
+        self.state.lock().await.devices.clone()
+    }
+
     pub async fn update_levels(&self, frame: LevelFrame) {
         *self.last_levels.lock().await = frame;
     }
 
-    // ════════════════════════════════════════════════════════════════════
+    fn emit(&self, event: Event) {
+        let _ = self.events.send(event);
+    }
+
+    // ══════════════════════════════════════════════════════════════════
+    // AUDIO PLANE: live stream lifecycle (called from the data server)
+    // ══════════════════════════════════════════════════════════════════
+
+    /// Create a real stream with a data source. Fires `stream-added`
+    /// routing rules, then returns the (possibly rule-moved) stream.
+    pub async fn create_live_stream(
+        &self,
+        application: &str,
+        fmt: &StreamFormat,
+        device: Option<&str>,
+    ) -> Result<AudioStream, AudioError> {
+        let created_id = {
+            let mut s = self.state.lock().await;
+            let (device_id, follows_default) = match device {
+                Some(id) => {
+                    let d = s
+                        .devices
+                        .get(id)
+                        .ok_or_else(|| AudioError::DeviceNotFound(id.to_string()))?;
+                    if d.direction == Direction::Input {
+                        return Err(AudioError::NotAnOutput(id.to_string()));
+                    }
+                    (id.to_string(), false)
+                }
+                None => (s.default_output.clone().ok_or(AudioError::NoOutput)?, true),
+            };
+
+            let id = format!("s-{}", self.next_stream_id.fetch_add(1, Ordering::Relaxed));
+            let mut stream = AudioStream::new(&id, application, StreamKind::Playback, &device_id);
+            stream.sample_rate = fmt.sample_rate;
+            stream.channels = u32::from(fmt.channels);
+            stream.format = fmt.format.as_str().to_string();
+            stream.follows_default = follows_default;
+
+            self.hub.insert(LiveStream::new(&id, application, &device_id));
+            s.streams.insert(id.clone(), stream);
+            id
+        };
+
+        // Routing rules for stream-added.
+        let routing_events = {
+            let (stream_snapshot, device_snapshot, profile) = {
+                let s = self.state.lock().await;
+                let stream = s.streams.get(&created_id).cloned();
+                let device = stream
+                    .as_ref()
+                    .and_then(|st| s.devices.get(&st.device).cloned());
+                (stream, device, s.profile.clone())
+            };
+            match stream_snapshot {
+                Some(stream) => {
+                    let ctx = TriggerContext {
+                        trigger: Trigger::StreamAdded,
+                        device: device_snapshot.as_ref(),
+                        stream: Some(&stream),
+                        profile: &profile,
+                    };
+                    self.apply_routing(self.routing.evaluate(&ctx)).await
+                }
+                None => Vec::new(),
+            }
+        };
+
+        self.emit(Event::StreamAdded {
+            id: created_id.clone(),
+            application: application.to_string(),
+        });
+        for event in routing_events {
+            self.emit(event);
+        }
+
+        // Return the final record (a rule may have moved it).
+        self.state
+            .lock()
+            .await
+            .streams
+            .get(&created_id)
+            .cloned()
+            .ok_or_else(|| AudioError::StreamNotFound(created_id))
+    }
+
+    pub async fn destroy_live_stream(&self, stream_id: &str) -> Result<(), AudioError> {
+        let existed = self.state.lock().await.streams.remove(stream_id).is_some();
+        self.hub.remove(stream_id);
+        if existed {
+            self.emit(Event::StreamRemoved { id: stream_id.to_string() });
+        }
+        Ok(())
+    }
+
+    /// Push canonical-format samples into a live stream's ring (sync —
+    /// called per DATA frame; conversion already happened at the edge).
+    pub fn push_stream_data(&self, stream_id: &str, samples: &[f32]) {
+        if let Some(live) = self.hub.get(stream_id) {
+            live.push(samples);
+        }
+    }
+
+    /// Move a stream to `device_id` (record + live). `follows_default`
+    /// is set by the caller (true only for default-follow moves).
+    async fn move_stream_internal(&self, stream_id: &str, device_id: &str, follows_default: bool) -> bool {
+        let changed = {
+            let mut s = self.state.lock().await;
+            match s.streams.get_mut(stream_id) {
+                Some(stream) => {
+                    let moved = stream.device != device_id;
+                    stream.device = device_id.to_string();
+                    stream.follows_default = follows_default;
+                    moved
+                }
+                None => false,
+            }
+        };
+        if changed {
+            if let Some(live) = self.hub.get(stream_id) {
+                live.set_device(device_id);
+            }
+        }
+        changed
+    }
+
+    // ══════════════════════════════════════════════════════════════════
     // Refresh: scan hardware, diff, run routing rules, persist
-    // ════════════════════════════════════════════════════════════════════
+    // ══════════════════════════════════════════════════════════════════
 
     pub async fn refresh(&self) -> Result<(), AudioError> {
         let backend = self.backend.clone();
@@ -119,7 +266,6 @@ impl AudioManager {
         {
             let mut s = self.state.lock().await;
 
-            // Devices that disappeared (snapshot kept for routing rules).
             let new_ids: HashSet<&str> = scanned.iter().map(|d| d.id.as_str()).collect();
             let gone: Vec<String> = s
                 .devices
@@ -134,7 +280,6 @@ impl AudioManager {
                 events.push(Event::DeviceRemoved { id });
             }
 
-            // Devices that appeared or changed.
             for device in scanned {
                 match s.devices.get(&device.id) {
                     None => {
@@ -146,7 +291,6 @@ impl AudioManager {
                         s.devices.insert(device.id.clone(), device);
                     }
                     Some(old) => {
-                        // `state` is manager-owned — excluded from comparison.
                         if !hardware_equal(old, &device) {
                             events.push(Event::DeviceChanged { id: device.id.clone() });
                             s.devices.insert(device.id.clone(), device);
@@ -155,7 +299,6 @@ impl AudioManager {
                 }
             }
 
-            // Keep defaults valid (and pick initial ones).
             let output = s
                 .default_output
                 .clone()
@@ -184,13 +327,43 @@ impl AudioManager {
                 }
             }
 
-            // Cosmetic device states: defaults are "active".
             for d in s.devices.values_mut() {
                 d.state = match (&s.default_output, &s.default_input) {
                     (Some(o), _) if d.id == *o => DeviceState::Active,
                     (_, Some(i)) if d.id == *i => DeviceState::Active,
                     _ => DeviceState::Available,
                 };
+            }
+        }
+
+        // Post-lock: close sinks for gone devices, retarget followers.
+        for device in &removed {
+            self.sinks.close_sink(&device.id).await;
+            let mut moved: Vec<(String, String)> = Vec::new();
+            {
+                let mut s = self.state.lock().await;
+                if let Some(default) = s.default_output.clone() {
+                    if default != device.id {
+                        let ids: Vec<String> = s
+                            .streams
+                            .values()
+                            .filter(|st| st.follows_default && st.device == device.id)
+                            .map(|st| st.id.clone())
+                            .collect();
+                        for id in ids {
+                            if let Some(st) = s.streams.get_mut(&id) {
+                                st.device = default.clone();
+                                moved.push((id, default.clone()));
+                            }
+                        }
+                    }
+                }
+            }
+            for (stream_id, device_id) in &moved {
+                if let Some(live) = self.hub.get(stream_id) {
+                    live.set_device(device_id);
+                }
+                events.push(Event::StreamChanged { id: stream_id.clone() });
             }
         }
 
@@ -203,7 +376,8 @@ impl AudioManager {
                 } else {
                     Trigger::DeviceRemoved
                 };
-                let ctx = TriggerContext { trigger, device: Some(device), stream: None, profile: &profile };
+                let ctx =
+                    TriggerContext { trigger, device: Some(device), stream: None, profile: &profile };
                 events.extend(self.apply_routing(self.routing.evaluate(&ctx)).await);
             }
         }
@@ -214,9 +388,9 @@ impl AudioManager {
         Ok(())
     }
 
-    // ════════════════════════════════════════════════════════════════════
-    // Restore persisted settings (called once after the initial scan)
-    // ════════════════════════════════════════════════════════════════════
+    // ══════════════════════════════════════════════════════════════════
+    // Restore persisted settings (once, after the initial scan)
+    // ══════════════════════════════════════════════════════════════════
 
     pub async fn restore(&self, settings: Settings) {
         let mut volume_pushes: Vec<(Device, u32)> = Vec::new();
@@ -301,15 +475,12 @@ impl AudioManager {
         for event in events {
             self.emit(event);
         }
-        if !events.is_empty() || !volume_pushes.is_empty() || !mute_pushes.is_empty() {
-            self.request_save().await;
-        }
         tracing::info!(events = events.len(), "persisted settings restored");
     }
 
-    // ════════════════════════════════════════════════════════════════════
-    // Routing execution (shared by refresh / CreateStream / SetProfile)
-    // ════════════════════════════════════════════════════════════════════
+    // ══════════════════════════════════════════════════════════════════
+    // Routing execution (device / stream / profile triggers)
+    // ══════════════════════════════════════════════════════════════════
 
     async fn apply_routing(&self, actions: Vec<ResolvedAction>) -> Vec<Event> {
         let mut events = Vec::new();
@@ -318,17 +489,17 @@ impl AudioManager {
         for action in actions {
             match action {
                 ResolvedAction::SetDefaultOutput { id, remember } => {
-                    if let Some(previous) = self.switch_default_output(&id).await {
-                        if remember && previous != id {
-                            self.routing.note_output_switch(Some(previous));
+                    if let Some((previous, follow_events)) = self.switch_default_output(&id).await {
+                        if remember && previous.as_deref() != Some(id.as_str()) {
+                            self.routing.note_output_switch(previous);
                             memory_changed = true;
                         }
                         events.push(Event::DefaultOutputChanged { id });
+                        events.extend(follow_events);
                     }
                 }
                 ResolvedAction::SetDefaultInput { id } => {
-                    if let Some(previous) = self.switch_default_input(&id).await {
-                        let _ = previous;
+                    if self.switch_default_input(&id).await.is_some() {
                         events.push(Event::DefaultInputChanged { id });
                     }
                 }
@@ -347,30 +518,25 @@ impl AudioManager {
                     }
                 }
                 ResolvedAction::MoveStream { stream_id, to } => {
-                    let changed = {
-                        let mut s = self.state.lock().await;
+                    let valid = {
+                        let s = self.state.lock().await;
                         let device_ok = s
                             .devices
                             .get(&to)
                             .map(|d| d.direction != Direction::Input)
                             .unwrap_or(false);
-                        match (device_ok, s.streams.get_mut(&stream_id)) {
-                            (true, Some(stream)) if stream.device != to => {
-                                stream.device = to.clone();
-                                true
-                            }
-                            _ => false,
-                        }
+                        device_ok && s.streams.contains_key(&stream_id)
                     };
-                    if changed {
+                    if valid && self.move_stream_internal(&stream_id, &to, false).await {
                         events.push(Event::StreamChanged { id: stream_id });
                     }
                 }
                 ResolvedAction::RestoreOutput => {
                     if let Some(id) = self.routing.take_previous_output() {
                         memory_changed = true;
-                        if self.switch_default_output(&id).await.is_some() {
+                        if let Some((_, follow_events)) = self.switch_default_output(&id).await {
                             events.push(Event::DefaultOutputChanged { id });
+                            events.extend(follow_events);
                         }
                     }
                 }
@@ -391,28 +557,45 @@ impl AudioManager {
         events
     }
 
-    /// Set the default output. Returns the previous default when the
-    /// switch actually happened (device valid + different from current).
-    async fn switch_default_output(&self, id: &str) -> Option<String> {
-        let mut s = self.state.lock().await;
-        let valid = s
-            .devices
-            .get(id)
-            .map(|d| d.direction != Direction::Input)
-            .unwrap_or(false);
-        if !valid || s.default_output.as_deref() == Some(id) {
-            return None;
-        }
-        let previous = s.default_output.replace(id.to_string());
-        if let Some(old) = &previous {
-            if let Some(d) = s.devices.get_mut(old) {
-                d.state = DeviceState::Available;
+    /// Set the default output and move `follows_default` streams along.
+    /// Returns `(previous default, StreamChanged events for followers)`
+    /// when the switch happened.
+    async fn switch_default_output(&self, id: &str) -> Option<(Option<String>, Vec<Event>)> {
+        let mut followers: Vec<String> = Vec::new();
+        let previous = {
+            let mut s = self.state.lock().await;
+            let valid = s
+                .devices
+                .get(id)
+                .map(|d| d.direction != Direction::Input)
+                .unwrap_or(false);
+            if !valid || s.default_output.as_deref() == Some(id) {
+                return None;
+            }
+            let previous = s.default_output.replace(id.to_string());
+            if let Some(old) = &previous {
+                if let Some(d) = s.devices.get_mut(old) {
+                    d.state = DeviceState::Available;
+                }
+            }
+            if let Some(d) = s.devices.get_mut(id) {
+                d.state = DeviceState::Active;
+            }
+            for stream in s.streams.values_mut() {
+                if stream.follows_default && stream.device != id {
+                    stream.device = id.to_string();
+                    followers.push(stream.id.clone());
+                }
+            }
+            previous
+        };
+        for stream_id in &followers {
+            if let Some(live) = self.hub.get(stream_id) {
+                live.set_device(id);
             }
         }
-        if let Some(d) = s.devices.get_mut(id) {
-            d.state = DeviceState::Active;
-        }
-        previous
+        let events = followers.into_iter().map(|id| Event::StreamChanged { id }).collect();
+        Some((previous, events))
     }
 
     async fn switch_default_input(&self, id: &str) -> Option<String> {
@@ -437,9 +620,9 @@ impl AudioManager {
         previous
     }
 
-    // ════════════════════════════════════════════════════════════════════
+    // ══════════════════════════════════════════════════════════════════
     // Hardware helpers + persistence
-    // ════════════════════════════════════════════════════════════════════
+    // ══════════════════════════════════════════════════════════════════
 
     async fn push_volume(&self, device: &Device, volume: u32) -> bool {
         let backend = self.backend.clone();
@@ -473,7 +656,6 @@ impl AudioManager {
         }
     }
 
-    /// Snapshot current settings into the debounced persistence writer.
     async fn request_save(&self) {
         let Some(store) = &self.store else { return };
         let settings = {
@@ -490,10 +672,7 @@ impl AudioManager {
                     .map(|(id, d)| {
                         (
                             id.clone(),
-                            DeviceSettings {
-                                volume: Some(d.volume),
-                                muted: Some(d.muted),
-                            },
+                            DeviceSettings { volume: Some(d.volume), muted: Some(d.muted) },
                         )
                     })
                     .collect(),
@@ -503,9 +682,9 @@ impl AudioManager {
         store.request_save(settings);
     }
 
-    // ════════════════════════════════════════════════════════════════════
+    // ══════════════════════════════════════════════════════════════════
     // Command dispatch
-    // ════════════════════════════════════════════════════════════════════
+    // ══════════════════════════════════════════════════════════════════
 
     pub async fn handle(&self, command: Command) -> Result<Value, AudioError> {
         match command {
@@ -513,7 +692,7 @@ impl AudioManager {
 
             Command::GetState => {
                 let s = self.state.lock().await;
-                Ok(snapshot(&s, self.backend_name))
+                Ok(snapshot(&s, self.backend_name, &self.config.data_socket_path, &self.hub))
             }
 
             Command::GetDefaults => {
@@ -539,14 +718,19 @@ impl AudioManager {
             Command::SetDefaultOutput { id } => {
                 {
                     let s = self.state.lock().await;
-                    let d = s.devices.get(&id)
+                    let d = s
+                        .devices
+                        .get(&id)
                         .ok_or_else(|| AudioError::DeviceNotFound(id.clone()))?;
                     if d.direction == Direction::Input {
                         return Err(AudioError::NotAnOutput(id));
                     }
                 }
-                if self.switch_default_output(&id).await.is_some() {
+                if let Some((_, follow_events)) = self.switch_default_output(&id).await {
                     self.emit(Event::DefaultOutputChanged { id: id.clone() });
+                    for event in follow_events {
+                        self.emit(event);
+                    }
                     self.request_save().await;
                 }
                 Ok(json!({ "default_output": id }))
@@ -555,7 +739,9 @@ impl AudioManager {
             Command::SetDefaultInput { id } => {
                 {
                     let s = self.state.lock().await;
-                    let d = s.devices.get(&id)
+                    let d = s
+                        .devices
+                        .get(&id)
                         .ok_or_else(|| AudioError::DeviceNotFound(id.clone()))?;
                     if d.direction == Direction::Output {
                         return Err(AudioError::NotAnInput(id));
@@ -617,37 +803,44 @@ impl AudioManager {
                 let s = self.state.lock().await;
                 let mut streams: Vec<&AudioStream> = s.streams.values().collect();
                 streams.sort_by(|a, b| a.id.cmp(&b.id));
+                let streams: Vec<Value> =
+                    streams.iter().map(|st| stream_json(st, &self.hub)).collect();
                 Ok(json!({ "streams": streams }))
             }
 
+            // Interim app registration (record only, silent — the data
+            // plane creates real streams). Useful for testing routing.
             Command::CreateStream { application, device, kind } => {
                 let kind = parse_stream_kind(&kind);
-                let (stream, device_snapshot) = {
+                let stream = {
                     let mut s = self.state.lock().await;
-                    let device_id = match device {
+                    let (device_id, follows_default) = match device {
                         Some(ref id) => {
                             if !s.devices.contains_key(id) {
                                 return Err(AudioError::DeviceNotFound(id.clone()));
                             }
-                            id.clone()
+                            (id.clone(), false)
                         }
                         None => match kind {
                             StreamKind::Playback | StreamKind::Monitoring => {
-                                s.default_output.clone().ok_or(AudioError::NoOutput)?
+                                (s.default_output.clone().ok_or(AudioError::NoOutput)?, true)
                             }
-                            _ => s.default_input.clone().ok_or(AudioError::NoInput)?,
+                            _ => (s.default_input.clone().ok_or(AudioError::NoInput)?, true),
                         },
                     };
                     let id =
                         format!("s-{}", self.next_stream_id.fetch_add(1, Ordering::Relaxed));
-                    let stream = AudioStream::new(&id, &application, kind, &device_id);
-                    s.streams.insert(id, stream.clone());
-                    (stream, s.devices.get(&device_id).cloned())
+                    let mut stream =
+                        AudioStream::new(&id, &application, kind, &device_id);
+                    stream.follows_default = follows_default;
+                    s.streams.insert(id.clone(), stream.clone());
+                    stream
                 };
-
-                // Routing rules for stream-added.
                 let routing_events = {
-                    let profile = self.state.lock().await.profile.clone();
+                    let (device_snapshot, profile) = {
+                        let s = self.state.lock().await;
+                        (s.devices.get(&stream.device).cloned(), s.profile.clone())
+                    };
                     let ctx = TriggerContext {
                         trigger: Trigger::StreamAdded,
                         device: device_snapshot.as_ref(),
@@ -656,7 +849,6 @@ impl AudioManager {
                     };
                     self.apply_routing(self.routing.evaluate(&ctx)).await
                 };
-
                 self.emit(Event::StreamAdded {
                     id: stream.id.clone(),
                     application: stream.application.clone(),
@@ -668,12 +860,7 @@ impl AudioManager {
             }
 
             Command::DestroyStream { stream_id } => {
-                {
-                    let mut s = self.state.lock().await;
-                    s.streams.remove(&stream_id)
-                        .ok_or_else(|| AudioError::StreamNotFound(stream_id.clone()))?;
-                }
-                self.emit(Event::StreamRemoved { id: stream_id.clone() });
+                self.destroy_live_stream(&stream_id).await?;
                 Ok(json!({ "removed": stream_id }))
             }
 
@@ -687,6 +874,10 @@ impl AudioManager {
                         .ok_or_else(|| AudioError::StreamNotFound(stream_id.clone()))?;
                     st.volume = volume;
                 }
+                // Applies at the next mixer period (~12.5 ms).
+                if let Some(live) = self.hub.get(&stream_id) {
+                    live.set_volume(volume);
+                }
                 self.emit(Event::StreamChanged { id: stream_id.clone() });
                 Ok(json!({ "stream_id": stream_id, "volume": volume }))
             }
@@ -698,21 +889,26 @@ impl AudioManager {
                         .ok_or_else(|| AudioError::StreamNotFound(stream_id.clone()))?;
                     st.muted = mute;
                 }
+                if let Some(live) = self.hub.get(&stream_id) {
+                    live.set_muted(mute);
+                }
                 self.emit(Event::StreamChanged { id: stream_id.clone() });
                 Ok(json!({ "stream_id": stream_id, "muted": mute }))
             }
 
             Command::MoveStream { stream_id, device_id } => {
                 {
-                    let mut s = self.state.lock().await;
+                    let s = self.state.lock().await;
                     if !s.devices.contains_key(&device_id) {
                         return Err(AudioError::DeviceNotFound(device_id));
                     }
-                    let st = s.streams.get_mut(&stream_id)
-                        .ok_or_else(|| AudioError::StreamNotFound(stream_id.clone()))?;
-                    st.device = device_id.clone();
+                    if !s.streams.contains_key(&stream_id) {
+                        return Err(AudioError::StreamNotFound(stream_id.clone()));
+                    }
                 }
-                self.emit(Event::StreamChanged { id: stream_id.clone() });
+                if self.move_stream_internal(&stream_id, &device_id, false).await {
+                    self.emit(Event::StreamChanged { id: stream_id.clone() });
+                }
                 Ok(json!({ "stream_id": stream_id, "device": device_id }))
             }
 
@@ -730,7 +926,6 @@ impl AudioManager {
                     s.profile = profile.clone();
                 }
                 self.emit(Event::ProfileChanged { profile: profile.clone() });
-                // Routing rules keyed on the new profile.
                 let routing_events = {
                     let ctx = TriggerContext {
                         trigger: Trigger::ProfileChanged,
@@ -777,7 +972,9 @@ impl AudioManager {
             }
 
             Command::GetLevels => {
-                let frame = *self.last_levels.lock().await;
+                // Output side is fresh from the mixers; input from the meter task.
+                let (out_rms, out_peak, out_clip) = self.out_levels.read();
+                let input = *self.last_levels.lock().await;
                 let s = self.state.lock().await;
                 let (volume, muted) = s
                     .default_output
@@ -788,10 +985,10 @@ impl AudioManager {
                 Ok(json!({
                     "master_volume": volume,
                     "muted": muted,
-                    "output_level": frame.output_level,
-                    "input_level": frame.input_level,
-                    "peak": frame.peak,
-                    "clipping": frame.clipping,
+                    "output_level": out_rms,
+                    "input_level": input.input_level,
+                    "peak": out_peak.max(input.peak),
+                    "clipping": out_clip || input.clipping,
                 }))
             }
 
@@ -811,7 +1008,7 @@ impl AudioManager {
                 Ok(json!({ "rules": count }))
             }
 
-            // Normally intercepted by the connection handler (needs the socket).
+            // Intercepted by the connection handler (needs the socket).
             Command::SubscribeEvents | Command::SubscribeLevels => {
                 Ok(json!({ "subscribed": true }))
             }
@@ -822,7 +1019,10 @@ impl AudioManager {
         let (target, snapshot_dev) = {
             let s = self.state.lock().await;
             let id = s.default_output.clone().ok_or(AudioError::NoOutput)?;
-            let device = s.devices.get(&id).cloned()
+            let device = s
+                .devices
+                .get(&id)
+                .cloned()
                 .ok_or_else(|| AudioError::DeviceNotFound(id.clone()))?;
             (id, device)
         };
@@ -856,10 +1056,25 @@ fn sorted_devices(s: &AudioState) -> Vec<&Device> {
     devices
 }
 
-fn snapshot(s: &AudioState, backend: &'static str) -> Value {
+/// Stream record enriched with live-audio stats.
+fn stream_json(s: &AudioStream, hub: &StreamHub) -> Value {
+    let mut v = serde_json::to_value(s).unwrap_or_else(|_| json!({}));
+    if let Some(live) = hub.get(&s.id) {
+        let (starved, _overflow) = live.stats();
+        v["live"] = Value::Bool(true);
+        v["buffered_ms"] = json!(live.buffered_ms());
+        v["underrun_periods"] = json!(starved);
+    } else {
+        v["live"] = Value::Bool(false);
+    }
+    v
+}
+
+fn snapshot(s: &AudioState, backend: &'static str, data_socket: &str, hub: &StreamHub) -> Value {
     let devices = sorted_devices(s);
     let mut streams: Vec<&AudioStream> = s.streams.values().collect();
     streams.sort_by(|a, b| a.id.cmp(&b.id));
+    let streams: Vec<Value> = streams.iter().map(|st| stream_json(st, hub)).collect();
     let (master_volume, master_muted) = s
         .default_output
         .as_ref()
@@ -870,6 +1085,7 @@ fn snapshot(s: &AudioState, backend: &'static str) -> Value {
         "service": "mitos-audio",
         "version": env!("CARGO_PKG_VERSION"),
         "backend": backend,
+        "data_socket": data_socket,
         "devices": devices,
         "streams": streams,
         "default_output": s.default_output,
