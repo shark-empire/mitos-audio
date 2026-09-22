@@ -1,39 +1,25 @@
 # mitos-audio
-Status (v0.2)
+| Levels | subscribe_levels (10 Hz frames, auto park when dropped), levels || Streams | create_stream (app registration, fires routing rules), destroy_stream || Routing | reload_routing |
 
-Working now	Stubbed / next
-ALSA backend: real enumeration + HW volume	udev hotplug (3 s poll for now)
-Hotplug & external changes → events	Routing rules engine
-Demo backend for dev/CI (auto-fallback)	Persistence
-23 commands + 12 events, master=def. output	Bluetooth (via mitos-bluetooth)
-libmitos-audio client crate	Effects, mic processing, metering
-mitos-audioctl CLI incl. rescan	Real application streams (audio plane)
-Build
+13. Try it (real hardware)
 
-# Real ALSA backend (default) — needs libasound2-dev / alsa-lib-devel:cargo build# Demo backend only (CI, containers, non-Linux):cargo build -p mitos-audio --no-default-features# Client crate alone:cargo build -p libmitos-audio
-Backend selection at runtime via /etc/mitos/audio.toml: backend = "auto" (default) | "alsa" | "demo".
+bash
 
-text
+cargo build   # needs libasound2-dev; udev needs no extra libs
 
-
----
-
-# Try it
-
-```bash
-cargo build
-
-# Terminal 1 — daemon (dev socket; on a real Linux desktop this uses ALSA):
 mkdir -p /tmp/mitos-dev
-echo 'socket_path = "/tmp/mitos-dev/audio.sock"' > /tmp/mitos-dev/audio.toml
+printf 'socket_path = "/tmp/mitos-dev/audio.sock"\nstate_path = "/tmp/mitos-dev/state.json"\nrouting_path = "/tmp/mitos-dev/routing.toml"\n' > /tmp/mitos-dev/audio.toml
 MITOS_AUDIO_CONFIG=/tmp/mitos-dev/audio.toml ./target/debug/mitos-audio
-# → "audio backend selected: alsa"  (or "demo" if no sound card)
+# → "audio backend selected: alsa", "udev hotplug watcher active", "routing rules loaded"
 
-# Terminal 2 — real hardware devices:
-./target/debug/mitos-audioctl --socket /tmp/mitos-dev/audio.sock devices
-./target/debug/mitos-audioctl --socket /tmp/mitos-dev/audio.sock volume 40   # actual mixer!
+./target/debug/mitos-audioctl --socket /tmp/mitos-dev/audio.sock watch   # talk → see your mic!
+# plug a USB headset → within ~400 ms: DeviceAdded + rule fires (default → headset)
+# unplug → DeviceRemoved + restore-output (back to speakers)
+# change volume in alsamixer → within 3 s: VolumeChanged + DeviceChanged
+# edit /tmp/mitos-dev/routing.toml → mitos-audioctl --socket … reload-routing
+Notes & honest caveats
 
-# Terminal 3 — the client crate watching events:
-MITOS_AUDIO_SOCK=/tmp/mitos-dev/audio.sock \
-  cargo run -p libmitos-audio --example volume_watch
-Then the fun test: plug or unplug a USB audio device (or change something in alsamixer in another terminal) — within ~3 s you'll see DeviceAdded / DeviceRemoved / DeviceChanged events flow into volume_watch and mitos-audioctl monitor, exactly what mitos-gui will consume.
+ udev crate API: code targets udev = "0.9"; on older versions socket.iter(None) becomes socket.iter() — one-line fix if your lockfile resolves differently.
+ Output metering is 0.0 on real ALSA by design: a management service above ALSA can't tap output samples without being the mixer. Input metering works today (capture PCM); output meters come alive when the roadmap's audio plane routes samples through mitos-audio.
+ Capture metering opens default: shareable via dsnoop on standard distros; if a device grabs the mic exclusively, metering holds its last value and retries (1 s backoff). metering.capture_input = false turns it off entirely.
+ Streams are still transient (not persisted across restarts) — correct behavior; apps re-register.
