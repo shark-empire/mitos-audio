@@ -72,6 +72,16 @@ enum Cmd {
     ReloadRouting,
     /// Live level meters (dedicated levels subscription, ~10 Hz)
     Watch,
+    
+    Tone {
+        #[arg(default_value_t = 440.0)]
+        freq: f64,
+        #[arg(default_value_t = 3.0)]
+        secs: f64,
+        /// Target device id (default: follow the default output)
+        #[arg(long)]
+        device: Option<String>,
+    },
 
 }
 
@@ -169,7 +179,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
         
-                Cmd::NewStream { application, device, kind } => {
+        Cmd::NewStream { application, device, kind } => {
             let mut params = json!({ "application": application });
             if let Some(d) = device { params["device"] = json!(d); }
             if let Some(k) = kind { params["kind"] = json!(k); }
@@ -183,6 +193,52 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Cmd::RmStream { id } => {
             call(&sock, "DestroyStream", json!({ "stream_id": id })).await?;
             println!("stream {id} removed");
+        }
+        
+        Cmd::Tone { freq, secs, device } => {
+            let data_socket = mitos_audio::engine::protocol::derive_data_socket(&sock);
+            let mut stream = UnixStream::connect(&data_socket).await?;
+
+            let mut open = json!({
+                "application": "mitos-tone",
+                "sample_rate": 48000,
+                "channels": 2,
+                "format": "s16le",
+            });
+            if let Some(d) = device {
+                open["device"] = json!(d);
+            }
+            df_write(&mut stream, 0x01, open.to_string().as_bytes()).await?;
+            let (kind, payload) = df_read(&mut stream).await?;
+            if kind == 0x82 {
+                let e: Value = serde_json::from_slice(&payload)?;
+                return Err(format!("[{}] {}", e["code"], e["message"]).into());
+            }
+            let ack: Value = serde_json::from_slice(&payload)?;
+            println!(
+                "playing {freq:.0} Hz for {secs:.0} s (stream {}) — Ctrl+C to stop",
+                ack["stream_id"].as_str().unwrap_or("?")
+            );
+
+            let chunk_frames = 4800usize; // 100 ms
+            let chunks = (secs * 10.0).ceil() as usize;
+            let mut phase: f64 = 0.0;
+            for _ in 0..chunks {
+                let mut buf = Vec::with_capacity(chunk_frames * 4);
+                for _ in 0..chunk_frames {
+                    let s = (0.5
+                        * (std::f64::consts::TAU * freq * phase / 48000.0).sin()
+                        * 32767.0) as i16;
+                    buf.extend_from_slice(&s.to_le_bytes()); // L
+                    buf.extend_from_slice(&s.to_le_bytes()); // R
+                    phase += 1.0;
+                }
+                df_write(&mut stream, 0x02, &buf).await?;
+                // Slightly ahead of realtime — the daemon's ring absorbs jitter.
+                tokio::time::sleep(std::time::Duration::from_millis(95)).await;
+            }
+            df_write(&mut stream, 0x03, &[]).await?;
+            println!("done");
         }
         Cmd::ReloadRouting => {
             let res = call(&sock, "ReloadRouting", json!({})).await?;
@@ -273,4 +329,28 @@ fn bar(v: f64) -> String {
     const WIDTH: usize = 24;
     let filled = (v.clamp(0.0, 1.0) * WIDTH as f64).round() as usize;
     format!("{}{}", "█".repeat(filled), "░".repeat(WIDTH - filled))
+}
+
+async fn df_write(stream: &mut UnixStream, kind: u8, payload: &[u8])
+    -> Result<(), Box<dyn std::error::Error>>
+{
+    use tokio::io::AsyncWriteExt;
+    let mut frame = Vec::with_capacity(5 + payload.len());
+    frame.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+    frame.push(kind);
+    frame.extend_from_slice(payload);
+    stream.write_all(&frame).await?;
+    Ok(())
+}
+
+async fn df_read(stream: &mut UnixStream)
+    -> Result<(u8, Vec<u8>), Box<dyn std::error::Error>>
+{
+    use tokio::io::AsyncReadExt;
+    let mut header = [0u8; 5];
+    stream.read_exact(&mut header).await?;
+    let len = u32::from_le_bytes([header[0], header[1], header[2], header[3]]) as usize;
+    let mut payload = vec![0u8; len];
+    stream.read_exact(&mut payload).await?;
+    Ok((header[4], payload))
 }
