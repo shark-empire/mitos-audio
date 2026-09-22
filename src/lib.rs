@@ -11,6 +11,7 @@ pub mod errors;
 pub mod ipc;
 pub mod manager;
 pub mod streams;
+pub mod engine;
 pub mod volume;
 pub mod backend;   // ← add this
 pub mod monitoring;
