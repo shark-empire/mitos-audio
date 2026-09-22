@@ -74,3 +74,19 @@ Next: membership in a mitos-audio group + per-application permissiongrants from 
 Protocol changes are additive only within a minor series.
 Clients must ignore unknown fields and unknown events.
 GetState returns "version" — check it, don't parse it strictly.
+
+
+4. Rust clients — use libmitos-audio (recommended)
+
+The repository ships a typed client crate (client/, package namelibmitos-audio). It implements the entire IPC surface with reconnecthandling baked in — this is what mitos-gui and mitos-settings should useinstead of hand-rolled sockets:
+
+AudioClient::connect() — one shared Arc<AudioClient> per process
+get_state(), list_devices(), set_volume(), set_default_output(), …— every command, fully typed
+subscribe() — background event monitor with exponential-backoffreconnect and a Resync event telling you when to refetch state
+See client/README.md for the full API tour and the recommended GUI loop(get_state → subscribe → react to Resync by refetching).
+
+For other languages, the raw-socket examples in the next section show thesame wire protocol from scratch.
+
+Also append to §6 (mitos-gui integration):
+
+In Rust, the recommended loop is one line shorter with the client crate:AudioClient::subscribe() delivers ClientEvent::Resync on every(re)connect — treat it as the signal to re-issue get_state(). Metersstill poll GetLevels every 50–100 ms until streaming metering lands.
