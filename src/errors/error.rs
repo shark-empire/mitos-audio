@@ -41,6 +41,9 @@ pub enum AudioError {
     
     #[error("audio backend error: {0}")]
     Backend(String),
+    
+    #[error("unsupported audio format: {0}")]
+    UnsupportedFormat(String),
 
     #[error("serialization error: {0}")]
     Serialization(#[from] serde_json::Error),
@@ -62,6 +65,7 @@ impl AudioError {
             Self::NoOutput => "no-output-device",
             Self::NoInput => "no-input-device",
             Self::Backend(_) => "backend-error",
+            Self::UnsupportedFormat(_) => "unsupported-format",
             Self::Io(_) => "io-error",
             Self::Serialization(_) => "serialization-error",
         }
