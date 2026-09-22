@@ -30,6 +30,9 @@ pub struct AudioStream {
     pub channels: u32,
     pub format: String,
     pub state: StreamState,
+    #[serde(default)]
+    pub follows_default: bool,
+
 }
 
 impl AudioStream {
@@ -45,6 +48,7 @@ impl AudioStream {
             channels: 2,
             format: "s16le".to_string(),
             state: StreamState::Running,
+            follows_default: false,
         }
     }
 
