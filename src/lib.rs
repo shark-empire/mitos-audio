@@ -12,3 +12,4 @@ pub mod ipc;
 pub mod manager;
 pub mod streams;
 pub mod volume;
+pub mod backend;   // ← add this
