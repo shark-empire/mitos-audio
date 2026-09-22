@@ -24,6 +24,13 @@ pub struct AudioConfig {
 
     // ── level metering ──
     pub metering: MeteringConfig,
+    
+    /// Data-plane socket (binary audio frames). When left at the default
+    /// and socket_path is non-default, the daemon derives it.
+    pub data_socket_path: String,
+    /// Playback buffer latency (µs = ms × 1000) per output sink.
+    pub playback_latency_ms: u32,
+
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -73,6 +80,8 @@ impl Default for AudioConfig {
             routing_path: "/etc/mitos/routing.toml".to_string(),
             hotplug: HotplugConfig::default(),
             metering: MeteringConfig::default(),
+            data_socket_path: "/run/mitos/audio-data.sock".to_string(),
+            playback_latency_ms: 50,
         }
     }
 }
