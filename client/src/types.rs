@@ -128,6 +128,15 @@ pub struct Levels {
     pub clipping: bool,
 }
 
+/// One level frame from `SubscribeLevels` / `GetLevels`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
+pub struct LevelFrame {
+    pub output_level: f32,
+    pub input_level: f32,
+    pub peak: f32,
+    pub clipping: bool,
+}
+
 /// Full daemon snapshot (`GetState`).
 #[derive(Debug, Clone, Deserialize)]
 pub struct SystemState {
