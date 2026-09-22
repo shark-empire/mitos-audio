@@ -9,8 +9,9 @@ description = "MITOS system audio management service (user-facing layer above AL
 license = "MIT"
 
 [features]
-default = ["alsa-backend"]
+default = ["alsa-backend", "udev-hotplug"]
 alsa-backend = ["alsa"]
+udev-hotplug = ["udev"]
 
 [dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "sync", "time"] }
@@ -22,3 +23,4 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 clap = { version = "4", features = ["derive"] }
 alsa = { version = "0.9", optional = true }
+udev = { version = "0.9", optional = true }
