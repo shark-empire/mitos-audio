@@ -64,6 +64,8 @@ pub struct StreamInfo {
     pub channels: u32,
     pub format: String,
     pub state: StreamState,
+    #[serde(default)]
+    pub follows_default: bool,
 }
 
 /// Result of `ListDevices` / `Rescan`.
@@ -154,4 +156,6 @@ pub struct SystemState {
     pub master_muted: bool,
     pub microphone: MicrophoneSummary,
     pub profile: String,
+    #[serde(default)]
+    pub data_socket: Option<String>,
 }
