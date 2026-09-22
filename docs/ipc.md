@@ -47,7 +47,25 @@ Example session
 |---------|--------|--------|
 | `Rescan` | – | `{ devices: [...], default_output, default_input }` — forces a hardware rescan (also automatic every ~3 s) |
 
+| Command | Params | Result |
+|---------|--------|--------|
+| `SubscribeLevels` | – | `{ subscribed: true }`, then `LevelChanged` event lines at ~`interval_ms` — **dedicated levels subscription**; pushed only while ≥1 level subscriber exists |
+| `CreateStream` | `application`, `device?`, `kind?` (`playback`\|`recording`\|`capture`\|`monitoring`) | `{ stream }` — interim application stream registration; fires `stream-added` routing rules |
+| `DestroyStream` | `stream_id` | `{ removed }` |
+| `ReloadRouting` | – | `{ rules: n }` — re-reads `routing.toml` |
 
+Add to the events table:
+
+| LevelChanged | { output_level, input_level, peak, clipping } | ~10 Hz, levels subscription only |
+
+Append a v0.3 semantics block:
+
+v0.3 semantics
+
+Persistence: defaults, per-device volume/mute, profile, mic settingsand routing memory are restored on daemon start from state_path(atomic write, 400 ms debounce). Disable with persist = false.
+Routing: routing.toml rules fire on device-added / device-removed/ stream-added / profile-changed — see docs/routing.md. ReloadRoutingre-reads the file at runtime.
+Metering: SubscribeLevels is a separate subscription fromSubscribeEvents and receives only LevelChanged frames (~10 Hz). Framesare pushed only while at least one level subscriber exists — idle GUIs costnothing, and ALSA capture metering parks its PCM when the last meter closes.GetLevels returns the last measured frame (may be stale with nosubscribers). On real ALSA, input levels come from the default capturePCM (best-effort); output levels are 0.0 until the audio plane exists.
+Hotplug: udev watcher (subsystem sound) → debounced instant rescan,plus the periodic poll (default 3 s) which also detects external mixerchanges (e.g. alsamixer).
 
 And append a "v0.2 semantics" block:
 
