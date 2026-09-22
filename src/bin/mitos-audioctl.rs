@@ -59,6 +59,20 @@ enum Cmd {
     /// Check the daemon is alive
     Ping,
     Rescan,
+    NewStream {
+        application: String,
+        #[arg(long)]
+        device: Option<String>,
+        #[arg(long)]
+        kind: Option<String>,   // playback | recording | capture | monitoring
+    },
+    /// Remove a stream by id
+    RmStream { id: String },
+    /// Reload routing rules from routing.toml
+    ReloadRouting,
+    /// Live level meters (dedicated levels subscription, ~10 Hz)
+    Watch,
+
 }
 
 #[tokio::main]
@@ -154,6 +168,57 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 print!("{}", line);
             }
         }
+        
+                Cmd::NewStream { application, device, kind } => {
+            let mut params = json!({ "application": application });
+            if let Some(d) = device { params["device"] = json!(d); }
+            if let Some(k) = kind { params["kind"] = json!(k); }
+            let res = call(&sock, "CreateStream", params).await?;
+            println!(
+                "stream {} created for '{}' on {} (volume {}%)",
+                res["stream"]["id"], res["stream"]["application"],
+                res["stream"]["device"], res["stream"]["volume"]
+            );
+        }
+        Cmd::RmStream { id } => {
+            call(&sock, "DestroyStream", json!({ "stream_id": id })).await?;
+            println!("stream {id} removed");
+        }
+        Cmd::ReloadRouting => {
+            let res = call(&sock, "ReloadRouting", json!({})).await?;
+            println!("routing reloaded: {} rule(s)", res["rules"]);
+        }
+        Cmd::Watch => {
+            let stream = UnixStream::connect(&sock).await?;
+            let (mut read_half, mut write_half) = stream.into_split();
+            let request = json!({ "id": 1, "command": "SubscribeLevels", "params": {} });
+            write_half.write_all(request.to_string().as_bytes()).await?;
+            write_half.write_all(b"\n").await?;
+            let mut reader = BufReader::new(read_half);
+            let mut line = String::new();
+            println!("mitos-audio levels (Ctrl+C to stop)");
+            loop {
+                line.clear();
+                if reader.read_line(&mut line).await? == 0 { break; }
+                let Ok(v) = serde_json::from_str::<Value>(line.trim()) else { continue };
+                if v.get("event").and_then(Value::as_str) != Some("LevelChanged") { continue; }
+                let d = &v["data"];
+                let out = d["output_level"].as_f64().unwrap_or(0.0);
+                let inp = d["input_level"].as_f64().unwrap_or(0.0);
+                let peak = d["peak"].as_f64().unwrap_or(0.0);
+                let clip = d["clipping"].as_bool().unwrap_or(false);
+                print!(
+                    "\r\x1b[2K OUT {} {:>3.0}%   IN {} {:>3.0}%   peak {:>3.0}%{}",
+                    bar(out), out * 100.0,
+                    bar(inp), inp * 100.0,
+                    peak * 100.0,
+                    if clip { "   ⚠ CLIPPING" } else { "" }
+                );
+                use std::io::Write;
+                std::io::stdout().flush().ok();
+            }
+            println!();
+        }
 
         Cmd::Ping => { call(&sock, "Ping", json!({})).await?; println!("mitos-audio is alive"); }
     }
@@ -202,4 +267,10 @@ fn print_devices(res: &Value, filter: Option<Direction>) -> Result<(), Box<dyn s
         res["default_output"].as_str().unwrap_or("-"),
         res["default_input"].as_str().unwrap_or("-"));
     Ok(())
+}
+
+fn bar(v: f64) -> String {
+    const WIDTH: usize = 24;
+    let filled = (v.clamp(0.0, 1.0) * WIDTH as f64).round() as usize;
+    format!("{}{}", "█".repeat(filled), "░".repeat(WIDTH - filled))
 }
