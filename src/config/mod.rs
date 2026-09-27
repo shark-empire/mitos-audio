@@ -18,6 +18,9 @@ pub struct AudioConfig {
     pub persist: bool,
     pub state_path: String,
     pub routing_path: String,
+    /// Per-application permission grants (microphone access today).
+    /// See `docs/security.md`. Reload at runtime with `ReloadPolicy`.
+    pub policy_path: String,
 
     // ── hotplug ──
     pub hotplug: HotplugConfig,
@@ -78,6 +81,7 @@ impl Default for AudioConfig {
             persist: true,
             state_path: "/var/lib/mitos/audio/state.json".to_string(),
             routing_path: "/etc/mitos/routing.toml".to_string(),
+            policy_path: "/etc/mitos/policy.toml".to_string(),
             hotplug: HotplugConfig::default(),
             metering: MeteringConfig::default(),
             data_socket_path: "/run/mitos/audio-data.sock".to_string(),
