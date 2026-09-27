@@ -16,7 +16,19 @@ pub enum ClientEvent {
     StreamRemoved { id: String },
     StreamChanged { id: String },
     ProfileChanged { profile: String },
-    MicrophoneChanged { muted: bool, gain: i32 },
+    MicrophoneChanged {
+        muted: bool,
+        gain: i32,
+        noise_suppression: bool,
+        echo_cancellation: bool,
+        agc: bool,
+    },
+    EffectsChanged {
+        device: String,
+        enabled: bool,
+        preset: String,
+        bands: Vec<f32>,
+    },
 
     /// **Synthetic** (not from the daemon): the monitor connected or
     /// reconnected. Fetch fresh state with `get_state()` when you see this —
@@ -63,6 +75,20 @@ impl ClientEvent {
             "MicrophoneChanged" => ClientEvent::MicrophoneChanged {
                 muted: field("muted").and_then(Value::as_bool)?,
                 gain: field("gain").and_then(Value::as_i64)? as i32,
+                // Defaulted, not `?`-required: a daemon predating these
+                // toggles won't send them, and that's not a parse failure.
+                noise_suppression: field("noise_suppression").and_then(Value::as_bool).unwrap_or(false),
+                echo_cancellation: field("echo_cancellation").and_then(Value::as_bool).unwrap_or(false),
+                agc: field("agc").and_then(Value::as_bool).unwrap_or(false),
+            },
+            "EffectsChanged" => ClientEvent::EffectsChanged {
+                device: as_str("device")?,
+                enabled: field("enabled").and_then(Value::as_bool)?,
+                preset: as_str("preset")?,
+                bands: field("bands")
+                    .and_then(Value::as_array)
+                    .map(|arr| arr.iter().filter_map(Value::as_f64).map(|v| v as f32).collect())
+                    .unwrap_or_default(),
             },
             other => ClientEvent::Unknown { name: other.to_string() },
         })

@@ -42,6 +42,10 @@ pub struct DeviceInfo {
     /// ALSA device id (e.g. "hw:0,0") when backed by real hardware.
     #[serde(default)]
     pub alsa: Option<String>,
+    /// Active Bluetooth codec label (e.g. "LDAC", "SBC"), once negotiated.
+    /// `None` for non-Bluetooth devices. See the daemon's `crate::bluetooth`.
+    #[serde(default)]
+    pub codec: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -102,6 +106,18 @@ pub struct VolumeChangeResult {
 pub struct ProfileList {
     pub profiles: Vec<String>,
     pub active: String,
+    /// Present since the profile hardware-capability catalog landed;
+    /// defaulted empty for an older daemon that predates it.
+    #[serde(default)]
+    pub catalog: Vec<ProfileCatalogEntry>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ProfileCatalogEntry {
+    pub id: String,
+    pub label: String,
+    pub channels: u32,
+    pub description: String,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -109,6 +125,12 @@ pub struct MicrophoneSummary {
     pub muted: bool,
     #[serde(rename = "gain_db")]
     pub gain_db: i32,
+    #[serde(default)]
+    pub noise_suppression: bool,
+    #[serde(default)]
+    pub echo_cancellation: bool,
+    #[serde(default)]
+    pub agc: bool,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -118,6 +140,29 @@ pub struct MicrophoneStatus {
     pub muted: bool,
     #[serde(rename = "gain_db")]
     pub gain_db: i32,
+    #[serde(default)]
+    pub noise_suppression: bool,
+    #[serde(default)]
+    pub echo_cancellation: bool,
+    #[serde(default)]
+    pub agc: bool,
+}
+
+/// `GetEffects` response / `EffectsChanged` event payload shape (the event
+/// itself omits `width`; see `ClientEvent::EffectsChanged`).
+#[derive(Debug, Clone, Deserialize)]
+pub struct EffectsStatus {
+    #[serde(default)]
+    pub device: Option<String>,
+    pub enabled: bool,
+    pub preset: String,
+    pub bands: Vec<f32>,
+    #[serde(default = "default_width")]
+    pub width: f32,
+}
+
+fn default_width() -> f32 {
+    1.0
 }
 
 #[derive(Debug, Clone, Deserialize)]

@@ -154,6 +154,17 @@ impl AudioClient {
         Ok(wrapper.rules)
     }
 
+    /// Re-read the daemon's policy.toml (per-application permission
+    /// grants); returns the rule count.
+    pub async fn reload_policy(&self) -> Result<usize, ClientError> {
+        #[derive(serde::Deserialize)]
+        struct Wrapper {
+            rules: usize,
+        }
+        let wrapper: Wrapper = self.typed("ReloadPolicy", json!({})).await?;
+        Ok(wrapper.rules)
+    }
+
     // ── plumbing ────────────────────────────────────────────────────────
 
     async fn call(&self, command: &str, params: Value) -> Result<Value, ClientError> {
@@ -301,6 +312,54 @@ impl AudioClient {
 
     pub async fn unmute_microphone(&self) -> Result<(), ClientError> {
         self.call("MuteMicrophone", json!({ "mute": false })).await?;
+        Ok(())
+    }
+
+    /// Toggle the microphone DSP stages (noise suppression, echo
+    /// cancellation, AGC). Any argument left `None` leaves that stage's
+    /// current setting unchanged. See `crate::microphone` in the daemon
+    /// crate for what these do (and don't do yet) to live audio.
+    pub async fn set_microphone_processing(
+        &self,
+        noise_suppression: Option<bool>,
+        echo_cancellation: Option<bool>,
+        agc: Option<bool>,
+    ) -> Result<(), ClientError> {
+        self.call(
+            "SetMicrophoneProcessing",
+            json!({
+                "noise_suppression": noise_suppression,
+                "echo_cancellation": echo_cancellation,
+                "agc": agc,
+            }),
+        )
+        .await?;
+        Ok(())
+    }
+
+    /// Effects (EQ/compressor/limiter) status for `device`, or the default
+    /// output when `None`.
+    pub async fn effects(&self, device: Option<&str>) -> Result<crate::types::EffectsStatus, ClientError> {
+        self.typed("GetEffects", json!({ "device": device })).await
+    }
+
+    pub async fn set_effects_enabled(&self, device: Option<&str>, enabled: bool) -> Result<(), ClientError> {
+        self.call("SetEffectsEnabled", json!({ "device": device, "enabled": enabled })).await?;
+        Ok(())
+    }
+
+    /// Apply a named preset: "flat", "music", "movie", "game", "voice",
+    /// or "podcast".
+    pub async fn set_effects_preset(&self, device: Option<&str>, preset: &str) -> Result<(), ClientError> {
+        self.call("SetEffectsPreset", json!({ "device": device, "preset": preset })).await?;
+        Ok(())
+    }
+
+    /// Set all 10 EQ band gains (dB); see
+    /// `crate::types` docs / the daemon's `effects::equalizer::BAND_FREQUENCIES`
+    /// for band order. Marks the device's preset as "custom".
+    pub async fn set_equalizer_bands(&self, device: Option<&str>, bands: [f32; 10]) -> Result<(), ClientError> {
+        self.call("SetEqualizerBands", json!({ "device": device, "bands": bands.to_vec() })).await?;
         Ok(())
     }
 
