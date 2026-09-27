@@ -21,6 +21,9 @@ pub struct Settings {
     pub profile: Option<String>,
     pub mic_muted: bool,
     pub mic_gain: i32,
+    pub mic_noise_suppression: bool,
+    pub mic_echo_cancellation: bool,
+    pub mic_agc: bool,
     pub devices: std::collections::HashMap<String, DeviceSettings>,
     pub routing: RoutingMemory,
 }
@@ -30,6 +33,21 @@ pub struct Settings {
 pub struct DeviceSettings {
     pub volume: Option<u32>,
     pub muted: Option<bool>,
+    pub effects: Option<PersistedEffects>,
+}
+
+/// Plain data snapshot of a device's `crate::effects::EffectsChain` — kept
+/// dependency-free of the `effects` module's own types (this module stays
+/// "just data", like the rest of persistence); `manager::state` translates
+/// in both directions.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PersistedEffects {
+    pub enabled: bool,
+    /// Lowercased `Preset::label()`, e.g. "music", "custom".
+    pub preset: String,
+    /// Ten band gains in dB, in `effects::equalizer::BAND_FREQUENCIES` order.
+    pub bands: Vec<f32>,
+    pub width: f32,
 }
 
 /// Handle used by the manager; actual writes happen in a background task.
