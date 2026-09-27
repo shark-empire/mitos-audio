@@ -13,7 +13,13 @@ pub mod manager;
 pub mod streams;
 pub mod engine;
 pub mod volume;
-pub mod backend;   // ← add this
+pub mod backend;
 pub mod monitoring;
 pub mod persistence;
 pub mod routing;
+pub mod profiles;
+pub mod policy;
+pub mod logging;
+pub mod microphone;
+pub mod bluetooth;
+pub mod effects;
