@@ -47,6 +47,12 @@ pub enum AudioError {
 
     #[error("serialization error: {0}")]
     Serialization(#[from] serde_json::Error),
+
+    #[error("profile {0} is not supported by device {1}")]
+    ProfileNotSupported(String, String),
+
+    #[error("permission denied: {0}")]
+    PermissionDenied(String),
 }
 
 impl AudioError {
@@ -68,6 +74,8 @@ impl AudioError {
             Self::UnsupportedFormat(_) => "unsupported-format",
             Self::Io(_) => "io-error",
             Self::Serialization(_) => "serialization-error",
+            Self::ProfileNotSupported(..) => "profile-not-supported",
+            Self::PermissionDenied(_) => "permission-denied",
         }
     }
 }
