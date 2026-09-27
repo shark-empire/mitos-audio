@@ -1,0 +1,24 @@
+# mitos-audio application policy — /etc/mitos/policy.toml
+#
+# Controls which applications may open a microphone (recording/capture)
+# stream. This is the permission grant docs/integration.md called out as
+# the next step for the security model — see docs/security.md.
+#
+# Missing or invalid file = every application is allowed (the pre-policy
+# default), logged at warn so it's never a silent surprise.
+#
+# Reload after editing:  mitos-audioctl reload-policy
+
+# What applies when no [[app]] rule below matches.
+default_microphone = "allow"   # "allow" | "deny"
+
+[[app]]
+name = "mitos-*"          # glob, case-insensitive — same matcher as routing.toml
+microphone = "allow"
+
+# Example: block a specific application from the microphone even though
+# the default allows it. First matching rule wins (file order).
+#
+# [[app]]
+# name = "sketchy-widget"
+# microphone = "deny"
