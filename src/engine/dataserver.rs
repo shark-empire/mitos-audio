@@ -39,7 +39,7 @@ pub async fn run(
         let (stream, _) = listener.accept().await?;
         let cred = stream.peer_cred().ok();
         if !permissions.check(cred.as_ref()) {
-            tracing::warn!("data plane: rejected connection");
+            crate::logging::audit::connection_rejected("data", cred.as_ref().map(|c| c.uid()));
             continue;
         }
         let manager = manager.clone();

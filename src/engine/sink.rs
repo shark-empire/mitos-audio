@@ -10,9 +10,10 @@ use std::time::{Duration, Instant};
 
 use crate::backend::{AudioBackend, OutputDevice};
 use crate::devices::device::Device;
+use crate::effects::EffectsChain;
 use crate::errors::AudioError;
 
-use super::{MIX_CHANNELS, OutputLevels, StreamHub};
+use super::{MIX_CHANNELS, MIX_RATE, OutputLevels, StreamHub};
 
 /// Frames per mixer period (12.5 ms @ 48 kHz stereo).
 const PERIOD_FRAMES: usize = 600;
@@ -27,6 +28,11 @@ pub struct SinkManager {
     levels: Arc<OutputLevels>,
     sinks: Mutex<HashMap<String, SinkHandle>>,
     last_attempt: Mutex<HashMap<String, Instant>>,
+    /// One effects chain per device, created on first reference (from
+    /// either a `manager::state` effects command or a sink opening,
+    /// whichever happens first) and kept for the daemon's lifetime so
+    /// settings survive the sink closing when idle and reopening later.
+    effects: Mutex<HashMap<String, Arc<Mutex<EffectsChain>>>>,
 }
 
 struct SinkHandle {
@@ -47,7 +53,22 @@ impl SinkManager {
             levels,
             sinks: Mutex::new(HashMap::new()),
             last_attempt: Mutex::new(HashMap::new()),
+            effects: Mutex::new(HashMap::new()),
         }
+    }
+
+    /// The shared effects chain for `device_id`, created (disabled, flat)
+    /// on first reference. `manager::state`'s effects commands configure
+    /// it; `mixer_loop` applies it once per period.
+    pub fn effects_for(&self, device_id: &str) -> Arc<Mutex<EffectsChain>> {
+        self.lock_effects()
+            .entry(device_id.to_string())
+            .or_insert_with(|| Arc::new(Mutex::new(EffectsChain::new(MIX_RATE as f32, MIX_CHANNELS))))
+            .clone()
+    }
+
+    fn lock_effects(&self) -> MutexGuard<'_, HashMap<String, Arc<Mutex<EffectsChain>>>> {
+        self.effects.lock().unwrap_or_else(|e| e.into_inner())
     }
 
     /// Lifecycle pass (~every 500 ms): ensure sinks exist for every
@@ -96,10 +117,11 @@ impl SinkManager {
                     let stop_thread = Arc::clone(&stop);
                     let hub = self.hub.clone();
                     let levels = self.levels.clone();
+                    let effects = self.effects_for(id);
                     let thread_name = id.clone();
                     let join = std::thread::Builder::new()
                         .name(format!("mitos-sink-{thread_name}"))
-                        .spawn(move || mixer_loop(thread_name, hub, out, levels, stop_thread))
+                        .spawn(move || mixer_loop(thread_name, hub, out, levels, effects, stop_thread))
                         .ok();
                     self.lock_sinks().insert(
                         id.clone(),
@@ -154,6 +176,7 @@ fn mixer_loop(
     hub: Arc<StreamHub>,
     mut out: Box<dyn OutputDevice>,
     levels: Arc<OutputLevels>,
+    effects: Arc<Mutex<EffectsChain>>,
     stop: Arc<AtomicBool>,
 ) {
     let mut mix = vec![0.0f32; PERIOD_FRAMES * MIX_CHANNELS];
@@ -188,6 +211,11 @@ fn mixer_loop(
         for s in mix.iter_mut() {
             *s = s.clamp(-1.0, 1.0);
         }
+
+        // Per-device EQ/compressor/spatial/limiter — see crate::effects.
+        // Applied before metering so levels/clipping reflect what actually
+        // reaches hardware, not the pre-effects mix.
+        effects.lock().unwrap_or_else(|e| e.into_inner()).process(&mut mix);
 
         levels.update(&mix);
 
