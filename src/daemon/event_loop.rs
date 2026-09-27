@@ -44,6 +44,7 @@ pub async fn run(mut config: AudioConfig) -> Result<(), AudioError> {
 
     let manager = Arc::new(AudioManager::new(config.clone(), backend.clone(), event_tx, store));
     tracing::info!(rules = manager.routing().rule_count(), "routing rules loaded");
+    tracing::info!(rules = manager.policy().rule_count(), "policy rules loaded");
 
     if let Err(e) = manager.refresh().await {
         tracing::error!(error = %e, "initial device scan failed (continuing)");
@@ -127,7 +128,7 @@ pub async fn run(mut config: AudioConfig) -> Result<(), AudioError> {
         let (stream, _) = listener.accept().await?;
         let cred = stream.peer_cred().ok();
         if !permissions.check(cred.as_ref()) {
-            tracing::warn!("control plane: rejected connection");
+            crate::logging::audit::connection_rejected("control", cred.as_ref().map(|c| c.uid()));
             continue;
         }
         let manager = manager.clone();
