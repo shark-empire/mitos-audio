@@ -11,17 +11,18 @@ use crate::devices::device::{Device, DeviceKind, DeviceState, Direction};
 use crate::engine::convert::StreamFormat;
 use crate::engine::sink::SinkManager;
 use crate::engine::{LiveStream, OutputLevels, StreamHub};
+use crate::effects::presets::Preset;
 use crate::errors::AudioError;
 use crate::ipc::messages::{Command, Event};
 use crate::monitoring::LevelFrame;
-use crate::persistence::{DeviceSettings, Settings, SettingsStore};
+use crate::persistence::{DeviceSettings, PersistedEffects, Settings, SettingsStore};
+use crate::policy::PolicyEngine;
 use crate::routing::{ResolvedAction, RoutingEngine, Trigger, TriggerContext};
 use crate::streams::stream::{AudioStream, StreamKind};
 
-const KNOWN_PROFILES: &[&str] = &[
-    "stereo", "headphones", "headset", "hdmi-stereo", "surround-5.1",
-    "surround-7.1", "bluetooth-music", "bluetooth-headset", "usb-dac",
-];
+// Known profile ids + per-device capability validation now live in
+// `crate::profiles`. `crate::profiles::is_known` replaces the old flat
+// `KNOWN_PROFILES` list check.
 
 /// Central audio state, command dispatch, routing execution, persistence,
 /// and the live-stream registry. The backend owns *hardware truth*; the
@@ -33,6 +34,7 @@ pub struct AudioManager {
     state: Mutex<AudioState>,
     events: broadcast::Sender<Event>,
     routing: RoutingEngine,
+    policy: PolicyEngine,
     store: Option<SettingsStore>,
     hub: Arc<StreamHub>,
     sinks: Arc<SinkManager>,
@@ -48,6 +50,12 @@ struct AudioState {
     default_input: Option<String>,
     mic_muted: bool,
     mic_gain: i32,
+    /// DSP toggles — see `crate::microphone`. Applying them to live audio
+    /// needs the (not yet built) capture data plane; these are the
+    /// control-plane settings, persisted and ready for that to land.
+    mic_noise_suppression: bool,
+    mic_echo_cancellation: bool,
+    mic_agc: bool,
     profile: String,
 }
 
@@ -59,6 +67,7 @@ impl AudioManager {
         store: Option<SettingsStore>,
     ) -> Self {
         let routing = RoutingEngine::load(&config.routing_path);
+        let policy = PolicyEngine::load(&config.policy_path);
         let hub = Arc::new(StreamHub::new());
         let out_levels = Arc::new(OutputLevels::new());
         let sinks = Arc::new(SinkManager::new(hub.clone(), backend.clone(), out_levels.clone()));
@@ -77,6 +86,7 @@ impl AudioManager {
             backend_name: backend.name(),
             backend,
             routing,
+            policy,
             store,
             hub,
             sinks,
@@ -88,6 +98,9 @@ impl AudioManager {
                 default_input: None,
                 mic_muted: false,
                 mic_gain: 0,
+                mic_noise_suppression: false,
+                mic_echo_cancellation: false,
+                mic_agc: false,
                 profile: "stereo".into(),
             }),
             events,
@@ -105,6 +118,10 @@ impl AudioManager {
 
     pub fn routing(&self) -> &RoutingEngine {
         &self.routing
+    }
+
+    pub fn policy(&self) -> &PolicyEngine {
+        &self.policy
     }
 
     pub fn sinks(&self) -> Arc<SinkManager> {
@@ -439,13 +456,36 @@ impl AudioManager {
                 }
             }
             if let Some(profile) = &settings.profile {
-                if KNOWN_PROFILES.contains(&profile.as_str()) && s.profile != *profile {
+                let supported = crate::profiles::is_known(profile)
+                    && s.default_output
+                        .as_ref()
+                        .and_then(|id| s.devices.get(id))
+                        .map(|d| crate::profiles::validate_for_device(profile, d).is_ok())
+                        // No default output yet to validate against — allow;
+                        // there is nothing to sync `active_profile` on either.
+                        .unwrap_or(true);
+                if supported && s.profile != *profile {
                     s.profile = profile.clone();
+                    if let Some(out_id) = s.default_output.clone() {
+                        if let Some(d) = s.devices.get_mut(&out_id) {
+                            if d.profiles.iter().any(|p| p == profile) {
+                                d.active_profile = Some(profile.clone());
+                            }
+                        }
+                    }
                     events.push(Event::ProfileChanged { profile: profile.clone() });
+                } else if !supported {
+                    tracing::warn!(
+                        profile,
+                        "persisted profile no longer supported by the default output — keeping current profile"
+                    );
                 }
             }
             s.mic_muted = settings.mic_muted;
             s.mic_gain = settings.mic_gain;
+            s.mic_noise_suppression = settings.mic_noise_suppression;
+            s.mic_echo_cancellation = settings.mic_echo_cancellation;
+            s.mic_agc = settings.mic_agc;
 
             for (id, ds) in &settings.devices {
                 let Some(d) = s.devices.get_mut(id) else { continue };
@@ -460,6 +500,9 @@ impl AudioManager {
                         d.muted = muted;
                         mute_pushes.push((d.clone(), muted));
                     }
+                }
+                if let Some(effects) = &ds.effects {
+                    self.restore_effects(id, effects);
                 }
             }
         }
@@ -503,20 +546,15 @@ impl AudioManager {
                         events.push(Event::DefaultInputChanged { id });
                     }
                 }
-                ResolvedAction::SetProfile { profile } => {
-                    let changed = {
-                        let mut s = self.state.lock().await;
-                        if KNOWN_PROFILES.contains(&profile.as_str()) && s.profile != profile {
-                            s.profile = profile.clone();
-                            true
-                        } else {
-                            false
-                        }
-                    };
-                    if changed {
-                        events.push(Event::ProfileChanged { profile });
-                    }
-                }
+                ResolvedAction::SetProfile { profile } => match self.apply_profile(&profile).await {
+                    Ok(true) => events.push(Event::ProfileChanged { profile }),
+                    Ok(false) => {}
+                    Err(e) => tracing::warn!(
+                        profile = %profile,
+                        error = %e,
+                        "routing: profile change skipped"
+                    ),
+                },
                 ResolvedAction::MoveStream { stream_id, to } => {
                     let valid = {
                         let s = self.state.lock().await;
@@ -620,6 +658,93 @@ impl AudioManager {
         previous
     }
 
+    /// Apply a persisted effects snapshot to a device's chain at startup.
+    /// A named preset is reapplied via `apply_preset` (recomputing its
+    /// curve); anything else (an unrecognized/corrupted preset string, or
+    /// `Custom`) falls back to the raw saved band values directly.
+    fn restore_effects(&self, device_id: &str, saved: &PersistedEffects) {
+        let chain = self.sinks.effects_for(device_id);
+        let mut chain = chain.lock().unwrap_or_else(|e| e.into_inner());
+        chain.enabled = saved.enabled;
+        match Preset::parse(&saved.preset) {
+            Some(preset) if preset != Preset::Custom => chain.apply_preset(preset),
+            _ => {
+                if saved.bands.len() == 10 {
+                    let mut bands = [0.0f32; 10];
+                    bands.copy_from_slice(&saved.bands);
+                    chain.set_bands(bands);
+                }
+            }
+        }
+        chain.set_width(saved.width);
+    }
+
+    /// Snapshot a device's effects chain into the persisted-data shape.
+    fn effects_snapshot(&self, device_id: &str) -> PersistedEffects {
+        let chain = self.sinks.effects_for(device_id);
+        let chain = chain.lock().unwrap_or_else(|e| e.into_inner());
+        PersistedEffects {
+            enabled: chain.enabled,
+            preset: chain.preset().label().to_lowercase(),
+            bands: chain.bands().to_vec(),
+            width: chain.width(),
+        }
+    }
+
+    /// Snapshot a device's effects chain into an `EffectsChanged` event and
+    /// broadcast it. Called after every effects command that changes state.
+    fn emit_effects_changed(&self, device_id: &str) {
+        let chain = self.sinks.effects_for(device_id);
+        let (enabled, preset, bands) = {
+            let chain = chain.lock().unwrap_or_else(|e| e.into_inner());
+            (chain.enabled, chain.preset().label().to_lowercase(), chain.bands().to_vec())
+        };
+        self.emit(Event::EffectsChanged { device: device_id.to_string(), enabled, preset, bands });
+    }
+
+    /// Resolve an optional device id to a concrete, existing device id:
+    /// the given id if present, else the current default output. Shared by
+    /// the effects commands so each doesn't repeat the same match.
+    async fn resolve_output_device(&self, device: &Option<String>) -> Result<String, AudioError> {
+        let s = self.state.lock().await;
+        match device {
+            Some(id) => {
+                if s.devices.contains_key(id) {
+                    Ok(id.clone())
+                } else {
+                    Err(AudioError::DeviceNotFound(id.clone()))
+                }
+            }
+            None => s.default_output.clone().ok_or(AudioError::NoOutput),
+        }
+    }
+
+    /// Validate `profile` (known id, and — when a default output is set —
+    /// supported by that device; see `crate::profiles`), apply it, and sync
+    /// the device's `active_profile`. Returns whether it actually changed.
+    /// Emits nothing and does not persist; callers do both.
+    async fn apply_profile(&self, profile: &str) -> Result<bool, AudioError> {
+        if !crate::profiles::is_known(profile) {
+            return Err(AudioError::InvalidProfile(profile.to_string()));
+        }
+        let mut s = self.state.lock().await;
+        if let Some(out_id) = s.default_output.clone() {
+            if let Some(device) = s.devices.get(&out_id) {
+                crate::profiles::validate_for_device(profile, device)?;
+            }
+        }
+        let changed = s.profile != profile;
+        s.profile = profile.to_string();
+        if let Some(out_id) = s.default_output.clone() {
+            if let Some(device) = s.devices.get_mut(&out_id) {
+                if device.profiles.iter().any(|p| p == profile) {
+                    device.active_profile = Some(profile.to_string());
+                }
+            }
+        }
+        Ok(changed)
+    }
+
     // ══════════════════════════════════════════════════════════════════
     // Hardware helpers + persistence
     // ══════════════════════════════════════════════════════════════════
@@ -666,13 +791,20 @@ impl AudioManager {
                 profile: Some(s.profile.clone()),
                 mic_muted: s.mic_muted,
                 mic_gain: s.mic_gain,
+                mic_noise_suppression: s.mic_noise_suppression,
+                mic_echo_cancellation: s.mic_echo_cancellation,
+                mic_agc: s.mic_agc,
                 devices: s
                     .devices
                     .iter()
                     .map(|(id, d)| {
                         (
                             id.clone(),
-                            DeviceSettings { volume: Some(d.volume), muted: Some(d.muted) },
+                            DeviceSettings {
+                                volume: Some(d.volume),
+                                muted: Some(d.muted),
+                                effects: Some(self.effects_snapshot(id)),
+                            },
                         )
                     })
                     .collect(),
@@ -812,6 +944,16 @@ impl AudioManager {
             // plane creates real streams). Useful for testing routing.
             Command::CreateStream { application, device, kind } => {
                 let kind = parse_stream_kind(&kind);
+                if matches!(kind, StreamKind::Recording | StreamKind::Capture) {
+                    if self.policy.check_microphone(&application) {
+                        crate::logging::audit::microphone_access_granted(&application);
+                    } else {
+                        crate::logging::audit::microphone_access_denied(&application);
+                        return Err(AudioError::PermissionDenied(format!(
+                            "{application} is not permitted to access the microphone"
+                        )));
+                    }
+                }
                 let stream = {
                     let mut s = self.state.lock().await;
                     let (device_id, follows_default) = match device {
@@ -912,19 +1054,73 @@ impl AudioManager {
                 Ok(json!({ "stream_id": stream_id, "device": device_id }))
             }
 
+            Command::GetEffects { device } => {
+                let id = self.resolve_output_device(&device).await?;
+                let chain = self.sinks.effects_for(&id);
+                let chain = chain.lock().unwrap_or_else(|e| e.into_inner());
+                Ok(json!({
+                    "device": id,
+                    "enabled": chain.enabled,
+                    "preset": chain.preset().label().to_lowercase(),
+                    "bands": chain.bands().to_vec(),
+                    "width": chain.width(),
+                }))
+            }
+
+            Command::SetEffectsEnabled { device, enabled } => {
+                let id = self.resolve_output_device(&device).await?;
+                {
+                    let chain = self.sinks.effects_for(&id);
+                    chain.lock().unwrap_or_else(|e| e.into_inner()).enabled = enabled;
+                }
+                self.emit_effects_changed(&id);
+                self.request_save().await;
+                Ok(json!({ "device": id, "enabled": enabled }))
+            }
+
+            Command::SetEffectsPreset { device, preset } => {
+                let id = self.resolve_output_device(&device).await?;
+                let parsed = Preset::parse(&preset)
+                    .ok_or_else(|| AudioError::Ipc(format!("unknown effects preset: {preset}")))?;
+                {
+                    let chain = self.sinks.effects_for(&id);
+                    chain.lock().unwrap_or_else(|e| e.into_inner()).apply_preset(parsed);
+                }
+                self.emit_effects_changed(&id);
+                self.request_save().await;
+                Ok(json!({ "device": id, "preset": parsed.label().to_lowercase() }))
+            }
+
+            Command::SetEqualizerBands { device, bands } => {
+                let id = self.resolve_output_device(&device).await?;
+                let bands: [f32; 10] = bands
+                    .try_into()
+                    .map_err(|v: Vec<f32>| AudioError::Ipc(format!("expected 10 band gains, got {}", v.len())))?;
+                {
+                    let chain = self.sinks.effects_for(&id);
+                    chain.lock().unwrap_or_else(|e| e.into_inner()).set_bands(bands);
+                }
+                self.emit_effects_changed(&id);
+                self.request_save().await;
+                Ok(json!({ "device": id, "bands": bands.to_vec(), "preset": "custom" }))
+            }
+
             Command::ListProfiles => {
                 let s = self.state.lock().await;
-                Ok(json!({ "profiles": KNOWN_PROFILES, "active": s.profile }))
+                Ok(json!({
+                    "profiles": crate::profiles::ids(),
+                    "active": s.profile,
+                    "catalog": crate::profiles::CATALOG.iter().map(|p| json!({
+                        "id": p.id,
+                        "label": p.label,
+                        "channels": p.channels,
+                        "description": p.description,
+                    })).collect::<Vec<_>>(),
+                }))
             }
 
             Command::SetProfile { profile } => {
-                if !KNOWN_PROFILES.contains(&profile.as_str()) {
-                    return Err(AudioError::InvalidProfile(profile));
-                }
-                {
-                    let mut s = self.state.lock().await;
-                    s.profile = profile.clone();
-                }
+                self.apply_profile(&profile).await?;
                 self.emit(Event::ProfileChanged { profile: profile.clone() });
                 let routing_events = {
                     let ctx = TriggerContext {
@@ -945,30 +1141,63 @@ impl AudioManager {
             Command::GetMicrophone => {
                 let s = self.state.lock().await;
                 let device = s.default_input.as_ref().and_then(|id| s.devices.get(id)).cloned();
-                Ok(json!({ "device": device, "muted": s.mic_muted, "gain_db": s.mic_gain }))
+                Ok(json!({
+                    "device": device,
+                    "muted": s.mic_muted,
+                    "gain_db": s.mic_gain,
+                    "noise_suppression": s.mic_noise_suppression,
+                    "echo_cancellation": s.mic_echo_cancellation,
+                    "agc": s.mic_agc,
+                }))
             }
 
             Command::SetMicrophoneGain { gain } => {
                 let clamped = gain.clamp(-30, 30);
-                let muted = {
+                let snapshot = {
                     let mut s = self.state.lock().await;
                     s.mic_gain = clamped;
-                    s.mic_muted
+                    mic_event_fields(&s)
                 };
-                self.emit(Event::MicrophoneChanged { muted, gain: clamped });
+                self.emit(snapshot);
                 self.request_save().await;
                 Ok(json!({ "gain_db": clamped }))
             }
 
             Command::MuteMicrophone { mute } => {
-                let gain = {
+                let snapshot = {
                     let mut s = self.state.lock().await;
                     s.mic_muted = mute;
-                    s.mic_gain
+                    mic_event_fields(&s)
                 };
-                self.emit(Event::MicrophoneChanged { muted: mute, gain });
+                self.emit(snapshot);
                 self.request_save().await;
                 Ok(json!({ "muted": mute }))
+            }
+
+            Command::SetMicrophoneProcessing { noise_suppression, echo_cancellation, agc } => {
+                let snapshot = {
+                    let mut s = self.state.lock().await;
+                    if let Some(v) = noise_suppression {
+                        s.mic_noise_suppression = v;
+                    }
+                    if let Some(v) = echo_cancellation {
+                        s.mic_echo_cancellation = v;
+                    }
+                    if let Some(v) = agc {
+                        s.mic_agc = v;
+                    }
+                    mic_event_fields(&s)
+                };
+                self.emit(snapshot.clone());
+                self.request_save().await;
+                let Event::MicrophoneChanged { noise_suppression, echo_cancellation, agc, .. } = snapshot else {
+                    unreachable!()
+                };
+                Ok(json!({
+                    "noise_suppression": noise_suppression,
+                    "echo_cancellation": echo_cancellation,
+                    "agc": agc,
+                }))
             }
 
             Command::GetLevels => {
@@ -1004,7 +1233,13 @@ impl AudioManager {
 
             Command::ReloadRouting => {
                 let count = self.routing.reload(&self.config.routing_path)?;
-                tracing::info!(rules = count, "routing rules reloaded");
+                crate::logging::audit::routing_reloaded(count);
+                Ok(json!({ "rules": count }))
+            }
+
+            Command::ReloadPolicy => {
+                let count = self.policy.reload(&self.config.policy_path)?;
+                crate::logging::audit::policy_reloaded(count);
                 Ok(json!({ "rules": count }))
             }
 
@@ -1050,6 +1285,21 @@ fn parse_stream_kind(kind: &Option<String>) -> StreamKind {
     }
 }
 
+/// Snapshot all five microphone fields into one `MicrophoneChanged` event.
+/// Every setter (`SetMicrophoneGain`, `MuteMicrophone`,
+/// `SetMicrophoneProcessing`) touches only its own field(s) but emits the
+/// full picture, so a client that only listens for this one event type
+/// never has a stale view of the rest.
+fn mic_event_fields(s: &AudioState) -> Event {
+    Event::MicrophoneChanged {
+        muted: s.mic_muted,
+        gain: s.mic_gain,
+        noise_suppression: s.mic_noise_suppression,
+        echo_cancellation: s.mic_echo_cancellation,
+        agc: s.mic_agc,
+    }
+}
+
 fn sorted_devices(s: &AudioState) -> Vec<&Device> {
     let mut devices: Vec<&Device> = s.devices.values().collect();
     devices.sort_by(|a, b| a.id.cmp(&b.id));
@@ -1092,7 +1342,13 @@ fn snapshot(s: &AudioState, backend: &'static str, data_socket: &str, hub: &Stre
         "default_input": s.default_input,
         "master_volume": master_volume,
         "master_muted": master_muted,
-        "microphone": { "muted": s.mic_muted, "gain_db": s.mic_gain },
+        "microphone": {
+            "muted": s.mic_muted,
+            "gain_db": s.mic_gain,
+            "noise_suppression": s.mic_noise_suppression,
+            "echo_cancellation": s.mic_echo_cancellation,
+            "agc": s.mic_agc,
+        },
         "profile": s.profile,
     })
 }
