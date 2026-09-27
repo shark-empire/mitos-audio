@@ -52,6 +52,16 @@ enum Cmd {
     /// Unmute the microphone
     #[command(name = "mic-unmute")]
     MicUnmute,
+    /// Toggle microphone DSP stages (any flag omitted is left unchanged)
+    #[command(name = "mic-dsp")]
+    MicDsp {
+        #[arg(long)]
+        noise_suppression: Option<bool>,
+        #[arg(long)]
+        echo_cancellation: Option<bool>,
+        #[arg(long)]
+        agc: Option<bool>,
+    },
     /// Show output/input levels
     Levels,
     /// Subscribe to live events (Ctrl+C to stop)
@@ -70,6 +80,39 @@ enum Cmd {
     RmStream { id: String },
     /// Reload routing rules from routing.toml
     ReloadRouting,
+    /// Reload application policy from policy.toml
+    ReloadPolicy,
+    /// Show effects (EQ/compressor/limiter) status for a device
+    Effects {
+        #[arg(long)]
+        device: Option<String>,
+    },
+    /// Turn effects on for a device
+    #[command(name = "effects-on")]
+    EffectsOn {
+        #[arg(long)]
+        device: Option<String>,
+    },
+    /// Turn effects off for a device
+    #[command(name = "effects-off")]
+    EffectsOff {
+        #[arg(long)]
+        device: Option<String>,
+    },
+    /// Apply a named preset: flat, music, movie, game, voice, podcast
+    #[command(name = "effects-preset")]
+    EffectsPreset {
+        preset: String,
+        #[arg(long)]
+        device: Option<String>,
+    },
+    /// Set all 10 EQ band gains in dB (31 62 125 250 500 1k 2k 4k 8k 16k Hz)
+    Eq {
+        #[arg(num_args = 10)]
+        bands: Vec<f32>,
+        #[arg(long)]
+        device: Option<String>,
+    },
     /// Live level meters (dedicated levels subscription, ~10 Hz)
     Watch,
     
@@ -153,11 +196,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             println!("microphone : {}", res["device"]["name"].as_str().unwrap_or("(none)"));
             println!("muted      : {}", res["muted"]);
             println!("gain       : {} dB", res["gain_db"]);
+            println!("noise sup. : {}", res["noise_suppression"]);
+            println!("echo canc. : {}", res["echo_cancellation"]);
+            println!("agc        : {}", res["agc"]);
         }
         Cmd::MicGain { gain } => { let res = call(&sock, "SetMicrophoneGain", json!({ "gain": gain })).await?;
                                    println!("microphone gain set to {} dB", res["gain_db"]); }
         Cmd::MicMute   => { call(&sock, "MuteMicrophone", json!({ "mute": true })).await?;  println!("microphone muted"); }
         Cmd::MicUnmute => { call(&sock, "MuteMicrophone", json!({ "mute": false })).await?; println!("microphone unmuted"); }
+        Cmd::MicDsp { noise_suppression, echo_cancellation, agc } => {
+            let res = call(&sock, "SetMicrophoneProcessing", json!({
+                "noise_suppression": noise_suppression,
+                "echo_cancellation": echo_cancellation,
+                "agc": agc,
+            })).await?;
+            println!("noise suppression : {}", res["noise_suppression"]);
+            println!("echo cancellation : {}", res["echo_cancellation"]);
+            println!("agc               : {}", res["agc"]);
+        }
 
         Cmd::Levels => { let res = call(&sock, "GetLevels", json!({})).await?;
                          println!("{}", serde_json::to_string_pretty(&res)?); }
@@ -244,6 +300,41 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let res = call(&sock, "ReloadRouting", json!({})).await?;
             println!("routing reloaded: {} rule(s)", res["rules"]);
         }
+        Cmd::ReloadPolicy => {
+            let res = call(&sock, "ReloadPolicy", json!({})).await?;
+            println!("policy reloaded: {} rule(s)", res["rules"]);
+        }
+        Cmd::Effects { device } => {
+            let res = call(&sock, "GetEffects", json!({ "device": device })).await?;
+            println!("device  : {}", res["device"].as_str().unwrap_or("-"));
+            println!("enabled : {}", res["enabled"]);
+            println!("preset  : {}", res["preset"].as_str().unwrap_or("-"));
+            if let Some(bands) = res["bands"].as_array() {
+                let freqs = ["31", "62", "125", "250", "500", "1k", "2k", "4k", "8k", "16k"];
+                for (f, b) in freqs.iter().zip(bands.iter()) {
+                    println!("  {:>4}Hz  {:+.1} dB", f, b.as_f64().unwrap_or(0.0));
+                }
+            }
+        }
+        Cmd::EffectsOn { device } => {
+            call(&sock, "SetEffectsEnabled", json!({ "device": device, "enabled": true })).await?;
+            println!("effects on");
+        }
+        Cmd::EffectsOff { device } => {
+            call(&sock, "SetEffectsEnabled", json!({ "device": device, "enabled": false })).await?;
+            println!("effects off");
+        }
+        Cmd::EffectsPreset { preset, device } => {
+            let res = call(&sock, "SetEffectsPreset", json!({ "device": device, "preset": preset })).await?;
+            println!("preset set to {}", res["preset"]);
+        }
+        Cmd::Eq { bands, device } => {
+            if bands.len() != 10 {
+                return Err("expected exactly 10 band values".into());
+            }
+            call(&sock, "SetEqualizerBands", json!({ "device": device, "bands": bands })).await?;
+            println!("equalizer updated (preset: custom)");
+        }
         Cmd::Watch => {
             let stream = UnixStream::connect(&sock).await?;
             let (mut read_half, mut write_half) = stream.into_split();
@@ -309,15 +400,16 @@ fn print_devices(res: &Value, filter: Option<Direction>) -> Result<(), Box<dyn s
             Some(_) => d.direction != Direction::Input,
         })
         .collect();
-    println!("{:<14} {:<24} {:<12} {:<9} {:<12} {:>8}",
-             "ID", "NAME", "KIND", "DIRECT", "STATE", "VOLUME");
+    println!("{:<14} {:<24} {:<12} {:<9} {:<12} {:>8}  {}",
+             "ID", "NAME", "KIND", "DIRECT", "STATE", "VOLUME", "CODEC");
     for d in &devices {
-        println!("{:<14} {:<24} {:<12} {:<9} {:<12} {:>7}%",
+        println!("{:<14} {:<24} {:<12} {:<9} {:<12} {:>7}%  {}",
             d.id, d.name,
             format!("{:?}", d.kind).to_lowercase(),
             format!("{:?}", d.direction).to_lowercase(),
             format!("{:?}", d.state).to_lowercase(),
-            d.volume);
+            d.volume,
+            d.codec.as_deref().unwrap_or("-"));
     }
     println!("\ndefault output: {}    default input: {}",
         res["default_output"].as_str().unwrap_or("-"),
