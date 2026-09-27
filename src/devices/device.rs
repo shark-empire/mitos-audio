@@ -61,6 +61,12 @@ pub struct Device {
     pub muted: bool,
     /// ALSA device identifier (e.g. "hw:0,0") — filled by the backend.
     pub alsa: Option<String>,
+    /// The active codec label (e.g. "LDAC", "SBC"), for Bluetooth devices
+    /// once one has been negotiated — see `crate::bluetooth::codec`. `None`
+    /// for every non-Bluetooth device, and for a Bluetooth device before
+    /// negotiation has happened.
+    #[serde(default)]
+    pub codec: Option<String>,
 }
 
 impl Device {
@@ -80,6 +86,7 @@ impl Device {
             volume: 50,
             muted: false,
             alsa: None,
+            codec: None,
         }
     }
 }
