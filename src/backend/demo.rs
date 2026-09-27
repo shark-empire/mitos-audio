@@ -3,6 +3,7 @@ use std::sync::{Mutex, MutexGuard};
 use super::backend::OutputDevice;
 use crate::engine::MIX_CHANNELS;
 use super::backend::AudioBackend;
+use crate::bluetooth::{BluetoothDeviceInfo, BluetoothManager, BluetoothProfile, Codec};
 use crate::devices::device::{Bus, Device, DeviceKind, Direction};
 use crate::errors::AudioError;
 use crate::monitoring::LevelFrame;
@@ -59,6 +60,16 @@ impl DemoBackend {
         bt.description = "A2DP/HFP headset (demo hardware — real BT via mitos-bluetooth)".into();
         bt.profiles = vec!["bluetooth-music".into(), "bluetooth-headset".into()];
         bt.active_profile = Some("bluetooth-music".into());
+        // Exercises the real bluetooth::manager coordination path (not a
+        // shortcut): a mid-range headset advertising SBC + AAC, same as a
+        // real `mitos-bluetooth` would report through `BluetoothCoordinator`.
+        let bluetooth = BluetoothManager::new();
+        let mut info = BluetoothDeviceInfo::new("AA:BB:CC:00:11:22", &bt.name);
+        info.profiles = vec![BluetoothProfile::A2dp, BluetoothProfile::Hfp];
+        info.codecs = vec![Codec::Sbc, Codec::AacLc];
+        if let Some(codec) = bluetooth.note_connected(info, crate::bluetooth::codec::PREFERRED_A2DP_CODECS) {
+            bt.codec = Some(codec.label().to_string());
+        }
 
         Self { devices: Mutex::new(vec![speakers, headphones, hdmi, usb_mic, bt]) }
     }

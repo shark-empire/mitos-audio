@@ -383,7 +383,9 @@ impl AudioBackend for AlsaBackend {
         }
         Ok(true)
     }
-    // ─── capture metering thread (module level) ─────────────────────────────
+}
+
+// ─── capture metering thread (module level) ─────────────────────────────
 
 fn spawn_capture_meter(shared: Arc<Mutex<MeterShared>>, active: Arc<AtomicBool>) {
     std::thread::Builder::new()
