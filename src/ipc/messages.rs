@@ -35,6 +35,14 @@ pub enum Command {
     GetMicrophone,
     SetMicrophoneGain { gain: i32 },
     MuteMicrophone { mute: bool },
+    /// Any field left `None` leaves that toggle unchanged — a partial
+    /// update, not a full replace (matches how `SetVolume`'s `device` is
+    /// optional rather than every setter needing every field).
+    SetMicrophoneProcessing {
+        noise_suppression: Option<bool>,
+        echo_cancellation: Option<bool>,
+        agc: Option<bool>,
+    },
     GetLevels,
     SubscribeEvents,
     Rescan,
@@ -42,6 +50,13 @@ pub enum Command {
     CreateStream { application: String, device: Option<String>, kind: Option<String> },
     DestroyStream { stream_id: String },
     ReloadRouting,
+    ReloadPolicy,
+    GetEffects { device: Option<String> },
+    SetEffectsEnabled { device: Option<String>, enabled: bool },
+    SetEffectsPreset { device: Option<String>, preset: String },
+    /// `bands` must have exactly 10 values (dB), one per
+    /// `effects::equalizer::BAND_FREQUENCIES` entry.
+    SetEqualizerBands { device: Option<String>, bands: Vec<f32> },
 }
 
 impl Request {
@@ -93,28 +108,38 @@ impl Request {
                 stream_id: req(&self.params, "stream_id")?,
                 device_id: req(&self.params, "device_id")?,
             },
-                "SubscribeLevels" => Command::SubscribeLevels,
-    "CreateStream" => Command::CreateStream {
-        application: req(&self.params, "application")?,
-        device: opt(&self.params, "device")?,
-        kind: opt(&self.params, "kind")?,
-    },
-    "DestroyStream" => Command::DestroyStream { stream_id: req(&self.params, "stream_id")? },
-    "ReloadRouting" => Command::ReloadRouting,
-
-// add to enum Event (sent ONLY on the dedicated levels channel):
-    /// Pushed at ~10 Hz to level subscribers while any exist.
-    LevelChanged {
-        output_level: f32,
-        input_level: f32,
-        peak: f32,
-        clipping: bool,
-    },
+            "SubscribeLevels" => Command::SubscribeLevels,
+            "CreateStream" => Command::CreateStream {
+                application: req(&self.params, "application")?,
+                device: opt(&self.params, "device")?,
+                kind: opt(&self.params, "kind")?,
+            },
+            "DestroyStream" => Command::DestroyStream { stream_id: req(&self.params, "stream_id")? },
+            "ReloadRouting" => Command::ReloadRouting,
+            "ReloadPolicy" => Command::ReloadPolicy,
+            "GetEffects" => Command::GetEffects { device: opt(&self.params, "device")? },
+            "SetEffectsEnabled" => Command::SetEffectsEnabled {
+                device: opt(&self.params, "device")?,
+                enabled: req(&self.params, "enabled")?,
+            },
+            "SetEffectsPreset" => Command::SetEffectsPreset {
+                device: opt(&self.params, "device")?,
+                preset: req(&self.params, "preset")?,
+            },
+            "SetEqualizerBands" => Command::SetEqualizerBands {
+                device: opt(&self.params, "device")?,
+                bands: req(&self.params, "bands")?,
+            },
             "ListProfiles" => Command::ListProfiles,
             "SetProfile" => Command::SetProfile { profile: req(&self.params, "profile")? },
             "GetMicrophone" => Command::GetMicrophone,
             "SetMicrophoneGain" => Command::SetMicrophoneGain { gain: req(&self.params, "gain")? },
             "MuteMicrophone" => Command::MuteMicrophone { mute: req(&self.params, "mute")? },
+            "SetMicrophoneProcessing" => Command::SetMicrophoneProcessing {
+                noise_suppression: opt(&self.params, "noise_suppression")?,
+                echo_cancellation: opt(&self.params, "echo_cancellation")?,
+                agc: opt(&self.params, "agc")?,
+            },
             "GetLevels" => Command::GetLevels,
             "SubscribeEvents" => Command::SubscribeEvents,
             other => return Err(AudioError::Ipc(format!("unknown command: {other}"))),
@@ -173,5 +198,16 @@ pub enum Event {
     StreamRemoved { id: String },
     StreamChanged { id: String },
     ProfileChanged { profile: String },
-    MicrophoneChanged { muted: bool, gain: i32 },
+    MicrophoneChanged {
+        muted: bool,
+        gain: i32,
+        noise_suppression: bool,
+        echo_cancellation: bool,
+        agc: bool,
+    },
+    /// Pushed at ~10 Hz to level subscribers while any exist (see
+    /// `SubscribeLevels`). Never sent on the general `SubscribeEvents`
+    /// channel.
+    LevelChanged { output_level: f32, input_level: f32, peak: f32, clipping: bool },
+    EffectsChanged { device: String, enabled: bool, preset: String, bands: Vec<f32> },
 }
