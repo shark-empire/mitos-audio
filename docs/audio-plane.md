@@ -4,7 +4,7 @@ How applications deliver actual audio to mitos-audio, and how it is mixedand rou
 
 Architecture
 
-application ──control──► /run/mitos/audio.sock        (JSONL: volumes, moves, events)application ──data────►  /run/mitos/audio-data.sock   (binary: PCM frames)data plane ingest: decode → stereo → resample → ring buffer (1 s)sink per target device: mix (sum, per-stream volume²) → clamp → ALSA
+application ──control──► /run/mitos/audio.sock        (JSONL: volumes, moves, events)application ──data────►  /run/mitos/audio-data.sock   (binary: PCM frames)data plane ingest: decode → stereo → resample → ring buffer (1 s)sink per target device: mix (sum, per-stream volume²) → clamp → effects chain (crate::effects, if enabled for that device) → meter → ALSA
 Two sockets by design: the control plane stays pure JSON-lines; the dataplane is pure binary framing. Either can be used without the other.
 
 Wire protocol
@@ -30,7 +30,7 @@ Buffering: 1 s ring per stream; overflowing clients get their oldestaudio droppe
 follows_default: streams opened without an explicit device followthe default output (and fire StreamChanged when it changes). ExplicitMoveStream/OPEN-device stops following.
 Sinks: one output device is opened (ALSA plughw) per device thatstreams target; idle sinks close after 5 s. Moving a stream takes effectat the next period — game→headphones + music→speakers work simultaneously.
 Latency: playback_latency_ms (default 50) per sink.
-Metering: output levels are measured from the actual mixed signal —SubscribeLevels meters now reflect playback in both ALSA and demo mode.
+Metering: output levels are measured from the mixed signal *after* the per-device effects chain (see docs/architecture.md's "Effects" section) — SubscribeLevels/clipping reflect what actually reaches ALSA, in both ALSA and demo mode.
 Permissions
 
 Same rules as the control plane: root, the daemon's uid (dev), and themitos-audio group (sudo groupadd -r mitos-audio; sudo usermod -aG mitos-audio <user>).

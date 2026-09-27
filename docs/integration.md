@@ -64,12 +64,17 @@ mitos-audioctl volume 80mitos-audioctl output headphonesmitos-audioctl mic-mutem
 
 Install services/mitos-audio.service. The unit creates /run/mitos(RuntimeDirectory=mitos), so no manual directory setup is needed.
 
-11. Permissions & security
+## 11. Permissions & security
 
-Socket is created 0660; only permitted peers may connect.
-v0.1: SO_PEERCRED check — root and the daemon's own uid.
-Next: membership in a mitos-audio group + per-application permissiongrants from policy.toml (microphone access in particular).
-12. Compatibility rules
+Socket is created 0660; only permitted peers may connect: root, the
+daemon's own uid, or members of the `mitos-audio` group (`SO_PEERCRED`,
+checked in `ipc/permissions.rs`).
+
+On top of that, `policy.toml` grants or denies individual applications
+microphone access (checked on `CreateStream`) — see `docs/security.md`
+for the file format and how to reload it without restarting the daemon.
+
+## 12. Compatibility rules
 
 Protocol changes are additive only within a minor series.
 Clients must ignore unknown fields and unknown events.
