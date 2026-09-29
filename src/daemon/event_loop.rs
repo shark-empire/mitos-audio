@@ -100,7 +100,8 @@ pub async fn run(mut config: AudioConfig) -> Result<(), AudioError> {
             loop {
                 tick.tick().await;
                 let devices = manager.devices_snapshot().await;
-                manager.sinks().tick(&devices).await;
+                let groups = manager.groups_snapshot().await;
+                manager.sinks().tick(&devices, &groups).await;
             }
         });
     }
