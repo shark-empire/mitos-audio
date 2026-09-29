@@ -20,6 +20,10 @@ applications don't have to speak the wire protocol by hand.
   devices. Hotplug via udev with a periodic-poll safety net.
 - **Per-application volume** — every stream gets its own volume, mute,
   and target device, independent of the system volume.
+- **Multi-speaker: independent or synchronized** — different apps on
+  different speakers already work independently; **speaker groups** add
+  one stream through several speakers in sync (mixed once, per-member
+  latency compensation, hot-plug aware). See `docs/architecture.md`.
 - **Routing** — `routing.toml` rules react to device hotplug, new
   streams, and profile changes (e.g. "Bluetooth headset connected →
   switch default output → restore previous output on disconnect"). See
@@ -117,6 +121,9 @@ mitos-audioctl output headphones          # switch default output
 mitos-audioctl volume 80                  # master volume
 mitos-audioctl mic-mute
 mitos-audioctl profile surround-5.1       # fails cleanly if the active device can't do it
+mitos-audioctl group-create "Living Room" speakers hdmi0   # a synchronized speaker group
+mitos-audioctl group-latency group-1 hdmi0 80              # that member's latency in ms
+mitos-audioctl tone --device group-1      # one stream, every member, in sync
 mitos-audioctl effects-preset podcast
 mitos-audioctl eq -- 3 2 0 -1 -1 0 1 2 3 3   # custom 10-band EQ, in dB (`--` before negative values)
 mitos-audioctl mic-dsp --noise-suppression true --agc true
@@ -157,7 +164,7 @@ needs real audio hardware to verify.
 ## Documentation
 
 - `docs/architecture.md` — how the pieces fit together
-- `docs/audio-model.md` — Device / Stream / Profile / Effects shapes
+- `docs/audio-model.md` — Device / Stream / Profile / Group / Effects shapes
 - `docs/ipc.md` — full command/event/error-code reference
 - `docs/audio-plane.md` — the data-plane wire format and its limits
 - `docs/routing.md` — `routing.toml` syntax
@@ -175,6 +182,14 @@ Documented honestly rather than glossed over:
   toggles, but nothing feeds live captured audio through them yet.
   Building that path (mirroring the already-working playback path) is
   the natural next increment.
+- **Speaker-group sync is aligned mixing plus configured latency
+  offsets — not automatic.** All members get the identical mix at the
+  same instant, and faster members are delayed by the latency *you*
+  configure per member; mitos-audio does not measure acoustic/network
+  latency, and does not correct slow clock drift between independent
+  hardware clocks over long sessions. A member's own per-device effects
+  aren't applied inside a group (the group has its own chain). See
+  `docs/audio-model.md`.
 - **Bluetooth is coordination, not a stack.** mitos-audio negotiates
   which codec *should* be used and maps A2DP/HFP/HSP onto its own
   profiles; it does not talk to a Bluetooth controller. A real Bluetooth
