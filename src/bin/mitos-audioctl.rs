@@ -78,6 +78,35 @@ enum Cmd {
     },
     /// Remove a stream by id
     RmStream { id: String },
+    /// Move a stream to another device or speaker group
+    #[command(name = "move-stream")]
+    MoveStream { stream_id: String, target: String },
+    /// List speaker groups (synchronized multi-speaker outputs)
+    Groups,
+    /// Create a group: group-create "Living Room" speakers hdmi0
+    #[command(name = "group-create")]
+    GroupCreate {
+        name: String,
+        #[arg(required = true)]
+        members: Vec<String>,
+    },
+    /// Delete a speaker group
+    #[command(name = "group-delete")]
+    GroupDelete { id: String },
+    /// Add a device to a group (--latency-ms: that device's output latency)
+    #[command(name = "group-add")]
+    GroupAdd {
+        id: String,
+        device: String,
+        #[arg(long)]
+        latency_ms: Option<u32>,
+    },
+    /// Remove a device from a group
+    #[command(name = "group-remove")]
+    GroupRemove { id: String, device: String },
+    /// Set a member's output latency in ms; faster members are delayed to match
+    #[command(name = "group-latency")]
+    GroupLatency { id: String, device: String, latency_ms: u32 },
     /// Reload routing rules from routing.toml
     ReloadRouting,
     /// Reload application policy from policy.toml
@@ -249,6 +278,64 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Cmd::RmStream { id } => {
             call(&sock, "DestroyStream", json!({ "stream_id": id })).await?;
             println!("stream {id} removed");
+        }
+        Cmd::MoveStream { stream_id, target } => {
+            call(&sock, "MoveStream", json!({ "stream_id": stream_id, "device_id": target })).await?;
+            println!("stream {stream_id} moved to {target}");
+        }
+        Cmd::Groups => {
+            let res = call(&sock, "ListGroups", json!({})).await?;
+            match res["groups"].as_array() {
+                Some(groups) if !groups.is_empty() => {
+                    for g in groups {
+                        println!("{}  \"{}\"", g["id"].as_str().unwrap_or("-"), g["name"].as_str().unwrap_or("-"));
+                        if let Some(members) = g["members"].as_array() {
+                            for m in members {
+                                println!(
+                                    "    {:<14} latency {} ms",
+                                    m["device_id"].as_str().unwrap_or("-"),
+                                    m["latency_ms"]
+                                );
+                            }
+                        }
+                    }
+                }
+                _ => println!("no speaker groups"),
+            }
+        }
+        Cmd::GroupCreate { name, members } => {
+            let res = call(&sock, "CreateGroup", json!({ "name": name, "members": members })).await?;
+            let id = res["id"].as_str().unwrap_or("");
+            println!("group {id} created — target it with: mitos-audioctl tone --device {id}");
+        }
+        Cmd::GroupDelete { id } => {
+            let res = call(&sock, "DeleteGroup", json!({ "id": id })).await?;
+            if res["removed"].as_bool().unwrap_or(false) {
+                println!("group {id} deleted");
+            } else {
+                println!("no such group: {id}");
+            }
+        }
+        Cmd::GroupAdd { id, device, latency_ms } => {
+            let mut params = json!({ "id": id, "device_id": device });
+            if let Some(l) = latency_ms {
+                params["latency_ms"] = json!(l);
+            }
+            let res = call(&sock, "AddGroupMember", params).await?;
+            println!("group {id} now has {} member(s)", res["members"]);
+        }
+        Cmd::GroupRemove { id, device } => {
+            let res = call(&sock, "RemoveGroupMember", json!({ "id": id, "device_id": device })).await?;
+            println!("group {id} now has {} member(s)", res["members"]);
+        }
+        Cmd::GroupLatency { id, device, latency_ms } => {
+            call(
+                &sock,
+                "SetGroupMemberLatency",
+                json!({ "id": id, "device_id": device, "latency_ms": latency_ms }),
+            )
+            .await?;
+            println!("{device} in group {id}: latency set to {latency_ms} ms");
         }
         
         Cmd::Tone { freq, secs, device } => {
