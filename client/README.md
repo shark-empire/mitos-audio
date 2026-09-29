@@ -7,7 +7,7 @@ mitos-settings, usable from any Rust application.
 
 ```toml
 [dependencies]
-libmitos-audio = "0.2"
+libmitos-audio = "0.3"
 tokio = { version = "1", features = ["rt", "net", "macros"] }
 ```
 
@@ -34,6 +34,7 @@ async fn main() -> Result<(), libmitos_audio::ClientError> {
 | Devices | `list_devices`, `get_device`, `rescan`, `set_default_output`, `set_default_input` |
 | Volume | `volume`, `set_volume`, `device_volume`, `set_device_volume`, `mute`, `unmute` |
 | Streams | `list_streams`, `set_stream_volume`, `set_stream_mute`, `move_stream`, `create_stream`, `destroy_stream` |
+| Speaker groups | `list_groups`, `create_group`, `delete_group`, `add_group_member`, `remove_group_member`, `set_group_member_latency` |
 | Profiles | `list_profiles`, `set_profile` |
 | Effects | `effects`, `set_effects_enabled`, `set_effects_preset`, `set_equalizer_bands` |
 | Microphone | `microphone`, `set_microphone_gain`, `mute_microphone`, `unmute_microphone`, `set_microphone_processing` |
@@ -42,7 +43,9 @@ async fn main() -> Result<(), libmitos_audio::ClientError> {
 
 Master volume is the default output device's volume. `set_volume` results
 carry `hw_applied: bool` — `false` means the device has no hardware volume
-control (state is tracked anyway). Effects and equalizer bands are
+control (state is tracked anyway). A speaker group's id works anywhere a
+device id does for stream targeting (`create_stream(app, Some(&id), None)`,
+`move_stream`). Effects and equalizer bands are
 per-device (an `Option<&str>` device argument, defaulting to the default
 output) — see the daemon's `docs/audio-model.md` for the shapes.
 
@@ -69,6 +72,7 @@ loop {
         Some(ClientEvent::DefaultOutputChanged { id }) => osd.notify_output(id),
         Some(ClientEvent::MuteChanged { muted }) => osd.show_mute(muted),
         Some(ClientEvent::EffectsChanged { device, preset, .. }) => osd.notify_preset(device, preset),
+        Some(ClientEvent::GroupChanged { id }) => group_list.refresh(id),
         Some(_) => {}
         None => break, // client dropped
     }

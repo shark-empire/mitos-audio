@@ -1,6 +1,6 @@
 [package]
 name = "libmitos-audio"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
 description = "Typed async client for the mitos-audio daemon (for mitos-gui, mitos-settings, apps)"
 license = "MIT"
