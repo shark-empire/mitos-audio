@@ -57,6 +57,14 @@ pub enum Command {
     /// `bands` must have exactly 10 values (dB), one per
     /// `effects::equalizer::BAND_FREQUENCIES` entry.
     SetEqualizerBands { device: Option<String>, bands: Vec<f32> },
+    /// Synchronized multi-speaker output — see `crate::groups`.
+    CreateGroup { name: String, members: Vec<String> },
+    ListGroups,
+    DeleteGroup { id: String },
+    /// `latency_ms` omitted defaults to 0 — see `crate::groups::compute_delays_ms`.
+    AddGroupMember { id: String, device_id: String, latency_ms: Option<u32> },
+    RemoveGroupMember { id: String, device_id: String },
+    SetGroupMemberLatency { id: String, device_id: String, latency_ms: u32 },
 }
 
 impl Request {
@@ -129,6 +137,26 @@ impl Request {
             "SetEqualizerBands" => Command::SetEqualizerBands {
                 device: opt(&self.params, "device")?,
                 bands: req(&self.params, "bands")?,
+            },
+            "CreateGroup" => Command::CreateGroup {
+                name: req(&self.params, "name")?,
+                members: req(&self.params, "members")?,
+            },
+            "ListGroups" => Command::ListGroups,
+            "DeleteGroup" => Command::DeleteGroup { id: req(&self.params, "id")? },
+            "AddGroupMember" => Command::AddGroupMember {
+                id: req(&self.params, "id")?,
+                device_id: req(&self.params, "device_id")?,
+                latency_ms: opt(&self.params, "latency_ms")?,
+            },
+            "RemoveGroupMember" => Command::RemoveGroupMember {
+                id: req(&self.params, "id")?,
+                device_id: req(&self.params, "device_id")?,
+            },
+            "SetGroupMemberLatency" => Command::SetGroupMemberLatency {
+                id: req(&self.params, "id")?,
+                device_id: req(&self.params, "device_id")?,
+                latency_ms: req(&self.params, "latency_ms")?,
             },
             "ListProfiles" => Command::ListProfiles,
             "SetProfile" => Command::SetProfile { profile: req(&self.params, "profile")? },
@@ -210,4 +238,6 @@ pub enum Event {
     /// channel.
     LevelChanged { output_level: f32, input_level: f32, peak: f32, clipping: bool },
     EffectsChanged { device: String, enabled: bool, preset: String, bands: Vec<f32> },
+    GroupChanged { id: String },
+    GroupRemoved { id: String },
 }
