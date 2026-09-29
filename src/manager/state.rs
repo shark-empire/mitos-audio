@@ -13,6 +13,7 @@ use crate::engine::sink::SinkManager;
 use crate::engine::{LiveStream, OutputLevels, StreamHub};
 use crate::effects::presets::Preset;
 use crate::errors::AudioError;
+use crate::groups::{GroupMember, SpeakerGroup};
 use crate::ipc::messages::{Command, Event};
 use crate::monitoring::LevelFrame;
 use crate::persistence::{DeviceSettings, PersistedEffects, Settings, SettingsStore};
@@ -57,6 +58,9 @@ struct AudioState {
     mic_echo_cancellation: bool,
     mic_agc: bool,
     profile: String,
+    /// Speaker groups — synchronized multi-device virtual targets. See
+    /// `crate::groups`.
+    groups: HashMap<String, SpeakerGroup>,
 }
 
 impl AudioManager {
@@ -102,6 +106,7 @@ impl AudioManager {
                 mic_echo_cancellation: false,
                 mic_agc: false,
                 profile: "stereo".into(),
+                groups: HashMap::new(),
             }),
             events,
             last_levels: Mutex::new(LevelFrame::default()),
@@ -136,6 +141,10 @@ impl AudioManager {
         self.state.lock().await.devices.clone()
     }
 
+    pub async fn groups_snapshot(&self) -> HashMap<String, SpeakerGroup> {
+        self.state.lock().await.groups.clone()
+    }
+
     pub async fn update_levels(&self, frame: LevelFrame) {
         *self.last_levels.lock().await = frame;
     }
@@ -160,12 +169,13 @@ impl AudioManager {
             let mut s = self.state.lock().await;
             let (device_id, follows_default) = match device {
                 Some(id) => {
-                    let d = s
-                        .devices
-                        .get(id)
-                        .ok_or_else(|| AudioError::DeviceNotFound(id.to_string()))?;
-                    if d.direction == Direction::Input {
-                        return Err(AudioError::NotAnOutput(id.to_string()));
+                    if let Some(d) = s.devices.get(id) {
+                        if d.direction == Direction::Input {
+                            return Err(AudioError::NotAnOutput(id.to_string()));
+                        }
+                    } else if !s.groups.contains_key(id) {
+                        // Not a real device and not a speaker group either.
+                        return Err(AudioError::DeviceNotFound(id.to_string()));
                     }
                     (id.to_string(), false)
                 }
@@ -486,6 +496,16 @@ impl AudioManager {
             s.mic_noise_suppression = settings.mic_noise_suppression;
             s.mic_echo_cancellation = settings.mic_echo_cancellation;
             s.mic_agc = settings.mic_agc;
+            // Groups restore as-is, no membership validation: a group whose
+            // Bluetooth member happens to be off at boot is still a valid
+            // definition, and `SinkManager::open_group_sink` already plays
+            // on whichever members are actually connected.
+            s.groups = settings.groups.clone();
+            for (group_id, saved) in &settings.group_effects {
+                if s.groups.contains_key(group_id) {
+                    self.restore_effects(group_id, saved);
+                }
+            }
 
             for (id, ds) in &settings.devices {
                 let Some(d) = s.devices.get_mut(id) else { continue };
@@ -703,13 +723,15 @@ impl AudioManager {
     }
 
     /// Resolve an optional device id to a concrete, existing device id:
-    /// the given id if present, else the current default output. Shared by
-    /// the effects commands so each doesn't repeat the same match.
+    /// the given id if present (a real device *or* a speaker group — a
+    /// group has its own effects chain, applied once before fan-out), else
+    /// the current default output. Shared by the effects commands so each
+    /// doesn't repeat the same match.
     async fn resolve_output_device(&self, device: &Option<String>) -> Result<String, AudioError> {
         let s = self.state.lock().await;
         match device {
             Some(id) => {
-                if s.devices.contains_key(id) {
+                if s.devices.contains_key(id) || s.groups.contains_key(id) {
                     Ok(id.clone())
                 } else {
                     Err(AudioError::DeviceNotFound(id.clone()))
@@ -809,6 +831,12 @@ impl AudioManager {
                     })
                     .collect(),
                 routing: self.routing.memory(),
+                groups: s.groups.clone(),
+                group_effects: s
+                    .groups
+                    .keys()
+                    .map(|id| (id.clone(), self.effects_snapshot(id)))
+                    .collect(),
             }
         };
         store.request_save(settings);
@@ -958,7 +986,7 @@ impl AudioManager {
                     let mut s = self.state.lock().await;
                     let (device_id, follows_default) = match device {
                         Some(ref id) => {
-                            if !s.devices.contains_key(id) {
+                            if !s.devices.contains_key(id) && !s.groups.contains_key(id) {
                                 return Err(AudioError::DeviceNotFound(id.clone()));
                             }
                             (id.clone(), false)
@@ -1041,7 +1069,7 @@ impl AudioManager {
             Command::MoveStream { stream_id, device_id } => {
                 {
                     let s = self.state.lock().await;
-                    if !s.devices.contains_key(&device_id) {
+                    if !s.devices.contains_key(&device_id) && !s.groups.contains_key(&device_id) {
                         return Err(AudioError::DeviceNotFound(device_id));
                     }
                     if !s.streams.contains_key(&stream_id) {
@@ -1052,6 +1080,106 @@ impl AudioManager {
                     self.emit(Event::StreamChanged { id: stream_id.clone() });
                 }
                 Ok(json!({ "stream_id": stream_id, "device": device_id }))
+            }
+
+            Command::CreateGroup { name, members } => {
+                let mut s = self.state.lock().await;
+                for m in &members {
+                    if !s.devices.contains_key(m) {
+                        return Err(AudioError::DeviceNotFound(m.clone()));
+                    }
+                }
+                // The counter restarts at 1 every daemon run but groups are
+                // persisted, so skip any id already taken (by a restored
+                // group, or in principle a device) instead of overwriting it.
+                let id = loop {
+                    let candidate = format!("group-{}", self.next_stream_id.fetch_add(1, Ordering::Relaxed));
+                    if !s.groups.contains_key(&candidate) && !s.devices.contains_key(&candidate) {
+                        break candidate;
+                    }
+                };
+                let mut group = SpeakerGroup::new(id.clone(), name.clone());
+                group.members =
+                    members.iter().map(|d| GroupMember { device_id: d.clone(), latency_ms: 0 }).collect();
+                s.groups.insert(id.clone(), group);
+                drop(s);
+                self.emit(Event::GroupChanged { id: id.clone() });
+                self.request_save().await;
+                Ok(json!({ "id": id, "name": name, "members": members }))
+            }
+
+            Command::ListGroups => {
+                let s = self.state.lock().await;
+                let mut groups: Vec<&SpeakerGroup> = s.groups.values().collect();
+                groups.sort_by(|a, b| a.id.cmp(&b.id));
+                Ok(json!({ "groups": groups }))
+            }
+
+            Command::DeleteGroup { id } => {
+                let removed = self.state.lock().await.groups.remove(&id).is_some();
+                if removed {
+                    self.sinks.close_sink(&id).await;
+                    self.emit(Event::GroupRemoved { id: id.clone() });
+                    self.request_save().await;
+                }
+                Ok(json!({ "removed": removed }))
+            }
+
+            Command::AddGroupMember { id, device_id, latency_ms } => {
+                {
+                    let mut s = self.state.lock().await;
+                    if !s.devices.contains_key(&device_id) {
+                        return Err(AudioError::DeviceNotFound(device_id));
+                    }
+                    let group = s
+                        .groups
+                        .get_mut(&id)
+                        .ok_or_else(|| AudioError::DeviceNotFound(id.clone()))?;
+                    if !group.has_member(&device_id) {
+                        group.members.push(GroupMember { device_id, latency_ms: latency_ms.unwrap_or(0) });
+                    }
+                }
+                self.sinks.close_sink(&id).await; // reopen next tick with the new membership
+                self.emit(Event::GroupChanged { id: id.clone() });
+                self.request_save().await;
+                let members = self.state.lock().await.groups.get(&id).map(|g| g.members.len()).unwrap_or(0);
+                Ok(json!({ "id": id, "members": members }))
+            }
+
+            Command::RemoveGroupMember { id, device_id } => {
+                {
+                    let mut s = self.state.lock().await;
+                    let group = s
+                        .groups
+                        .get_mut(&id)
+                        .ok_or_else(|| AudioError::DeviceNotFound(id.clone()))?;
+                    group.members.retain(|m| m.device_id != device_id);
+                }
+                self.sinks.close_sink(&id).await;
+                self.emit(Event::GroupChanged { id: id.clone() });
+                self.request_save().await;
+                let members = self.state.lock().await.groups.get(&id).map(|g| g.members.len()).unwrap_or(0);
+                Ok(json!({ "id": id, "members": members }))
+            }
+
+            Command::SetGroupMemberLatency { id, device_id, latency_ms } => {
+                {
+                    let mut s = self.state.lock().await;
+                    let group = s
+                        .groups
+                        .get_mut(&id)
+                        .ok_or_else(|| AudioError::DeviceNotFound(id.clone()))?;
+                    let member = group
+                        .members
+                        .iter_mut()
+                        .find(|m| m.device_id == device_id)
+                        .ok_or_else(|| AudioError::DeviceNotFound(device_id.clone()))?;
+                    member.latency_ms = latency_ms;
+                }
+                self.sinks.close_sink(&id).await; // reopen next tick with recomputed delays
+                self.emit(Event::GroupChanged { id: id.clone() });
+                self.request_save().await;
+                Ok(json!({ "id": id, "device_id": device_id, "latency_ms": latency_ms }))
             }
 
             Command::GetEffects { device } => {
@@ -1331,6 +1459,8 @@ fn snapshot(s: &AudioState, backend: &'static str, data_socket: &str, hub: &Stre
         .and_then(|id| s.devices.get(id))
         .map(|d| (d.volume, d.muted))
         .unwrap_or((0, false));
+    let mut groups: Vec<&SpeakerGroup> = s.groups.values().collect();
+    groups.sort_by(|a, b| a.id.cmp(&b.id));
     json!({
         "service": "mitos-audio",
         "version": env!("CARGO_PKG_VERSION"),
@@ -1338,6 +1468,7 @@ fn snapshot(s: &AudioState, backend: &'static str, data_socket: &str, hub: &Stre
         "data_socket": data_socket,
         "devices": devices,
         "streams": streams,
+        "groups": groups,
         "default_output": s.default_output,
         "default_input": s.default_input,
         "master_volume": master_volume,
