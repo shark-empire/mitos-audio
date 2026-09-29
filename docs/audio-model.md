@@ -88,6 +88,58 @@ one on) → stereo widener → limiter (always, last). See
 `docs/architecture.md`'s "Effects" section for why the limiter is
 unconditional.
 
+## Speaker groups
+
+```
+SpeakerGroup
+├── id         "group-N", assigned at creation
+├── name       display name
+└── members[]
+    ├── device_id    an existing output device
+    └── latency_ms   configured output latency of that device (0 = none requested)
+```
+
+A group id is accepted wherever a stream target is: `CreateStream`'s
+`device`, `MoveStream`'s `device_id`, the data plane's OPEN `device`.
+It is **not** accepted as the system default output (`SetDefaultOutput`)
+— profiles, master volume and hardware mute all assume the default
+output is a real device with channels and a mixer.
+
+Every member receives the identical mixed buffer. To line members up,
+each is delayed by `max(latency_ms) - its own latency_ms`, so the
+slowest member sets the pace:
+
+| member | configured latency | delay applied |
+|---|---|---|
+| Speaker A | 20 ms | 60 ms |
+| Speaker B | 80 ms | 0 ms |
+
+**What is and isn't automatic.** `latency_ms` is something you set
+(`mitos-audioctl group-latency`); mitos-audio does not measure acoustic
+or network latency, because that needs a per-transport round trip this
+project has no input for — Bluetooth in particular. Continuous
+clock-drift correction (two independent hardware clocks nominally at
+48 kHz disagreeing by a few ppm) is likewise not implemented: over a
+long session two members can slowly walk apart. The group is one mix,
+delivered at the same instant, with configured offsets — accurate to
+hardware buffer granularity for local devices, best-effort beyond that.
+
+Effects are applied once per group, before fan-out. A group has its own
+effects chain, addressed by its id like any device
+(`mitos-audioctl effects-preset music --device group-1`) and persisted
+with the group. A member's *own* per-device effects chain is **not**
+applied while it plays as part of a group — the group's mixer writes to
+the member directly — so tune the group's chain, not the members'.
+
+**A device that is both a group member and a direct stream target at the
+same time** gets opened twice (once by its own sink, once by the group's
+fan-out) — whether that works depends on the backend supporting
+concurrent opens of the same hardware (ALSA's `dmix`, where configured,
+usually does; a bare exclusive `hw:` device will not). Routing the same
+device both ways isn't recommended until this is worth a proper shared
+device-handle cache; using a device only inside the group (or only
+directly) sidesteps it entirely.
+
 ## Microphone
 
 ```

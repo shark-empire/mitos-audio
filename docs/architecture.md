@@ -74,6 +74,7 @@ An application registers a stream once on the control plane
 | `effects/` | Per-device EQ, compressor, limiter, stereo widener — see "Effects" below |
 | `microphone/` | Mic DSP algorithms: AGC, noise gate, echo canceller — see "Microphone processing" below |
 | `bluetooth/` | Codec negotiation and profile mapping — coordination, not a Bluetooth stack; see its own module docs |
+| `groups/` | Speaker groups — synchronized multi-speaker output as a virtual device, plus the latency-compensation math (the real-time side lives in `engine/sink.rs`) |
 | `policy/` | `policy.toml` — per-application permission grants (microphone access today) |
 | `logging/` | Structured audit-trail logging for security-relevant events |
 | `persistence/` | `state.json` — defaults, per-device volume/mute/effects, mic settings, routing memory, restored on startup |
@@ -127,6 +128,59 @@ already shows up as an ordinary `Device` with `bus: Bluetooth`. The
 (`bluetooth::codec::negotiate`) and which mitos-audio profile a
 connected profile maps to (`bluetooth::profile`). See the module's own
 docs for the full rationale.
+
+## Multi-speaker: independent vs. synchronized
+
+Two different things people mean by "multiple speakers", handled two
+different ways:
+
+**Independent / asynchronous** — different applications on different
+speakers (music on A, browser on B, game on headphones). This needed no
+new machinery: a stream already targets exactly one device, every device
+already gets its own sink and mixer thread, and streams on different
+devices share no clock or playback position. `CreateStream` /
+`MoveStream` / `routing.toml` already do this.
+
+**Synchronized** — one stream through several speakers at once. This is
+a **speaker group** (`groups/`): a virtual device with its own id that a
+stream targets exactly like `"speakers"` or `"hdmi0"`, so `CreateStream`,
+`MoveStream`, and the data plane's `device` field all accept a group id
+with no change to how streams work. The difference is entirely in the
+sink layer (`engine::sink`):
+
+```
+stream -> LiveStream (device = "group-1")
+              |
+      group_mixer_loop  (one mix per period, via the same mix_period()
+              |          every normal sink uses, then the group's effects chain)
+              |
+   +----------+----------+
+   v          v          v
+ delay A    delay B    delay C     <- per-member DelayLine (latency compensation)
+   |          |          |
+ speaker A  speaker B  speaker C
+```
+
+Mixing **once** and handing the identical buffer to every member is what
+keeps them sample-aligned at the source — the alternative (each member's
+own mixer thread pulling from a shared stream) would have the members
+*compete* for the stream's samples, since a `LiveStream`'s ring has
+exactly one consumer. Each member's `DelayLine` then holds back
+lower-latency members by the difference to the slowest one
+(`groups::compute_delays_ms`), the same "delay the faster speaker" idea
+as any multi-room audio system.
+
+A group keeps playing on whichever members are connected: unplug a
+speaker and within ~0.5 s the group sink reopens with the remaining
+members; plug it back and it rejoins. Group definitions persist across
+restarts even when a member is absent at boot.
+
+What this deliberately does **not** do: measure latency for you, or
+continuously correct clock drift. Latencies are configured per member
+(`group-latency`), and independent hardware clocks that disagree by a few
+ppm will slowly drift apart over long sessions — correcting that needs a
+per-transport clock measurement (and for Bluetooth, transport-level
+support) that ALSA does not expose generically. See `docs/audio-model.md`.
 
 ## Security model
 

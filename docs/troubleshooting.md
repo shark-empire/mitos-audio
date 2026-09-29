@@ -87,6 +87,25 @@ persisted state, but there is no capture data path yet for the DSP to
 run on. This isn't backend- or hardware-specific; it's the same on ALSA
 and demo.
 
+## Speakers in a group don't line up
+
+A group plays one identical mix through every member, delayed by the
+difference in each member's *configured* latency — mitos-audio does not
+measure latency itself. If two speakers are audibly offset, set their
+latencies:
+
+```sh
+mitos-audioctl groups                                   # see members
+mitos-audioctl group-latency group-1 bt-speaker 150     # the laggy one, in ms
+mitos-audioctl group-latency group-1 speakers 20
+```
+
+Bluetooth speakers are the usual culprit (100-300 ms is normal for
+A2DP). If they start aligned and drift apart over a long session, that
+is independent hardware clocks disagreeing — not corrected yet; see
+`docs/audio-model.md`. A member that's unplugged is dropped from the
+group within about half a second and rejoins when it returns.
+
 ## Where to look next
 
 - `docs/architecture.md` — how the pieces fit together
