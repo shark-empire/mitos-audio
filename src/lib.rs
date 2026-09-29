@@ -23,3 +23,4 @@ pub mod logging;
 pub mod microphone;
 pub mod bluetooth;
 pub mod effects;
+pub mod groups;
