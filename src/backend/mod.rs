@@ -3,7 +3,7 @@ pub mod demo;
 #[cfg(feature = "alsa-backend")]
 pub mod alsa;
 
-pub use backend::{AudioBackend, OutputDevice};
+pub use backend::{AudioBackend, InputDevice, OutputDevice};
 
 use std::sync::Arc;
 

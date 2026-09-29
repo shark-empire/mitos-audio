@@ -1,6 +1,6 @@
 use std::sync::{Mutex, MutexGuard};
 
-use super::backend::OutputDevice;
+use super::backend::{InputDevice, OutputDevice};
 use crate::engine::MIX_CHANNELS;
 use super::backend::AudioBackend;
 use crate::bluetooth::{BluetoothDeviceInfo, BluetoothManager, BluetoothProfile, Codec};
@@ -22,6 +22,51 @@ impl OutputDevice for DemoOutput {
         Ok(())
     }
 }
+
+/// Synthetic microphone for demo mode: a quiet, steady tone rather than
+/// silence, so the capture path — and anything downstream of it, like
+/// `crate::microphone::MicrophoneProcessor` — has real, non-trivial
+/// samples to work with instead of an all-zero buffer. Like `DemoOutput`,
+/// this doesn't pace itself against wall-clock time; `SourceManager`'s
+/// capture loop runs it as fast as the CPU allows, same as the existing
+/// playback path does for `DemoOutput` — fine for a dev/test-only backend.
+pub struct DemoInput {
+    phase: f32,
+}
+
+impl DemoInput {
+    pub fn new() -> Self {
+        Self { phase: 0.0 }
+    }
+}
+
+impl Default for DemoInput {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl InputDevice for DemoInput {
+    fn read(&mut self, buf: &mut [f32]) -> Result<usize, AudioError> {
+        const FREQ_HZ: f32 = 220.0;
+        const AMPLITUDE: f32 = 0.05;
+        let step = std::f32::consts::TAU * FREQ_HZ / crate::engine::MIX_RATE as f32;
+        let frames = buf.len() / MIX_CHANNELS;
+        for i in 0..frames {
+            let sample = AMPLITUDE * self.phase.sin();
+            self.phase = (self.phase + step) % std::f32::consts::TAU;
+            for ch in 0..MIX_CHANNELS {
+                buf[i * MIX_CHANNELS + ch] = sample;
+            }
+        }
+        Ok(frames)
+    }
+
+    fn recover(&mut self) -> Result<(), AudioError> {
+        Ok(())
+    }
+}
+
 /// In-memory "hardware" for development, CI, and non-Linux builds.
 ///
 /// Behaves like real hardware: volume/mute writes persist and are
@@ -84,6 +129,10 @@ impl AudioBackend for DemoBackend {
     
     fn open_output(&self, _device: &Device) -> Result<Box<dyn OutputDevice>, AudioError> {
         Ok(Box::new(DemoOutput))
+    }
+
+    fn open_input(&self, _device: &Device) -> Result<Box<dyn InputDevice>, AudioError> {
+        Ok(Box::new(DemoInput::new()))
     }
 
     fn set_volume(&self, device: &Device, volume: u32) -> Result<bool, AudioError> {

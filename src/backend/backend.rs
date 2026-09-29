@@ -13,6 +13,19 @@ pub trait OutputDevice: Send {
     fn recover(&mut self) -> Result<(), AudioError>;
 }
 
+/// One opened input device (the capture half of a backend) — the mirror
+/// of `OutputDevice`. `read` returns interleaved stereo f32 at the
+/// canonical mix rate; implementations convert from the device's native
+/// format.
+pub trait InputDevice: Send {
+    /// Read up to `buf.len() / channel_count` frames into `buf`; returns
+    /// frames read. May return 0 without error (e.g. a brief underrun).
+    fn read(&mut self, buf: &mut [f32]) -> Result<usize, AudioError>;
+
+    /// Recover after overrun/suspend (ALSA `prepare`).
+    fn recover(&mut self) -> Result<(), AudioError>;
+}
+
 /// Hardware-facing interface. Implementations must be `Send + Sync`;
 /// they are invoked through `tokio::task::spawn_blocking`.
 ///
@@ -36,6 +49,11 @@ pub trait AudioBackend: Send + Sync {
     /// Open `device` for playback (audio plane). Default: unsupported.
     fn open_output(&self, _device: &Device) -> Result<Box<dyn OutputDevice>, AudioError> {
         Err(AudioError::Backend("backend has no playback support".into()))
+    }
+
+    /// Open `device` for capture (audio plane). Default: unsupported.
+    fn open_input(&self, _device: &Device) -> Result<Box<dyn InputDevice>, AudioError> {
+        Err(AudioError::Backend("backend has no capture support".into()))
     }
 
     /// Current level frame (input side; output is measured by the mixer).
