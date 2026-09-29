@@ -8,6 +8,7 @@ pub mod convert;
 pub mod dataserver;
 pub mod protocol;
 pub mod sink;
+pub mod source;
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
@@ -212,6 +213,50 @@ impl OutputLevels {
             f32::from_bits(self.peak.load(Ordering::Relaxed)),
             self.clipping.load(Ordering::Relaxed),
         )
+    }
+}
+
+/// The most recently mixed (post-effects) period of audio, shared so a
+/// capture source can use it as an echo canceller's reference signal —
+/// see `crate::microphone::echo_cancellation`. Deliberately system-wide
+/// rather than per-device: the common echo scenario (a laptop's own
+/// speakers leaking into its own mic) involves one relevant playback
+/// device, and a single shared reference keeps this simple at the cost of
+/// being an approximation on a multi-output setup (the reference will be
+/// whichever sink mixed most recently).
+pub struct PlaybackReference {
+    inner: Mutex<Vec<f32>>,
+}
+
+impl PlaybackReference {
+    pub fn new() -> Self {
+        Self { inner: Mutex::new(Vec::new()) }
+    }
+
+    pub fn set(&self, mixed: &[f32]) {
+        *self.lock() = mixed.to_vec();
+    }
+
+    /// A copy of the last mixed period, only if its length matches `len`
+    /// exactly — a mismatch (e.g. no sink has run yet) is treated as "no
+    /// usable reference" rather than guessed at.
+    pub fn get(&self, len: usize) -> Option<Vec<f32>> {
+        let buf = self.lock();
+        if buf.len() == len {
+            Some(buf.clone())
+        } else {
+            None
+        }
+    }
+
+    fn lock(&self) -> MutexGuard<'_, Vec<f32>> {
+        self.inner.lock().unwrap_or_else(|e| e.into_inner())
+    }
+}
+
+impl Default for PlaybackReference {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
