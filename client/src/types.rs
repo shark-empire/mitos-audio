@@ -193,6 +193,9 @@ pub struct SystemState {
     pub backend: String,
     pub devices: Vec<DeviceInfo>,
     pub streams: Vec<StreamInfo>,
+    /// Speaker groups; empty for a daemon that predates them.
+    #[serde(default)]
+    pub groups: Vec<GroupInfo>,
     #[serde(default)]
     pub default_output: Option<String>,
     #[serde(default)]
@@ -203,4 +206,23 @@ pub struct SystemState {
     pub profile: String,
     #[serde(default)]
     pub data_socket: Option<String>,
+}
+
+/// A speaker group: a virtual output that plays one stream, in sync,
+/// through every member device. Target it like any device id
+/// (`create_stream`, `move_stream`). See the daemon's `docs/audio-model.md`.
+#[derive(Debug, Clone, Deserialize)]
+pub struct GroupInfo {
+    pub id: String,
+    pub name: String,
+    pub members: Vec<GroupMemberInfo>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct GroupMemberInfo {
+    pub device_id: String,
+    /// Configured output latency (ms) used to line members up — 0 means
+    /// no compensation requested.
+    #[serde(default)]
+    pub latency_ms: u32,
 }

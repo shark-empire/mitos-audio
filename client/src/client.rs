@@ -287,6 +287,78 @@ impl AudioClient {
         Ok(())
     }
 
+    // ── speaker groups (synchronized multi-speaker output) ────────────
+    //
+    // A group id works anywhere a device id does for stream targeting:
+    // `create_stream(app, Some(&group.id), None)` or
+    // `move_stream(stream, &group.id)`.
+
+    pub async fn list_groups(&self) -> Result<Vec<crate::types::GroupInfo>, ClientError> {
+        #[derive(serde::Deserialize)]
+        struct Wrapper {
+            groups: Vec<crate::types::GroupInfo>,
+        }
+        let wrapper: Wrapper = self.typed("ListGroups", json!({})).await?;
+        Ok(wrapper.groups)
+    }
+
+    /// Create a group from existing output device ids; returns the new
+    /// group's id (e.g. `"group-3"`).
+    pub async fn create_group(&self, name: &str, members: &[&str]) -> Result<String, ClientError> {
+        #[derive(serde::Deserialize)]
+        struct Wrapper {
+            id: String,
+        }
+        let wrapper: Wrapper = self.typed("CreateGroup", json!({ "name": name, "members": members })).await?;
+        Ok(wrapper.id)
+    }
+
+    /// Returns whether a group with that id existed.
+    pub async fn delete_group(&self, id: &str) -> Result<bool, ClientError> {
+        #[derive(serde::Deserialize)]
+        struct Wrapper {
+            removed: bool,
+        }
+        let wrapper: Wrapper = self.typed("DeleteGroup", json!({ "id": id })).await?;
+        Ok(wrapper.removed)
+    }
+
+    /// Add a device to a group. `latency_ms` is that device's output
+    /// latency, used to delay faster members so all line up (see
+    /// `set_group_member_latency`); omit for 0.
+    pub async fn add_group_member(
+        &self,
+        id: &str,
+        device_id: &str,
+        latency_ms: Option<u32>,
+    ) -> Result<(), ClientError> {
+        let mut params = json!({ "id": id, "device_id": device_id });
+        if let Some(l) = latency_ms {
+            params["latency_ms"] = json!(l);
+        }
+        self.call("AddGroupMember", params).await?;
+        Ok(())
+    }
+
+    pub async fn remove_group_member(&self, id: &str, device_id: &str) -> Result<(), ClientError> {
+        self.call("RemoveGroupMember", json!({ "id": id, "device_id": device_id })).await?;
+        Ok(())
+    }
+
+    pub async fn set_group_member_latency(
+        &self,
+        id: &str,
+        device_id: &str,
+        latency_ms: u32,
+    ) -> Result<(), ClientError> {
+        self.call(
+            "SetGroupMemberLatency",
+            json!({ "id": id, "device_id": device_id, "latency_ms": latency_ms }),
+        )
+        .await?;
+        Ok(())
+    }
+
     pub async fn list_profiles(&self) -> Result<crate::types::ProfileList, ClientError> {
         self.typed("ListProfiles", json!({})).await
     }

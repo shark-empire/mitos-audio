@@ -29,6 +29,8 @@ pub enum ClientEvent {
         preset: String,
         bands: Vec<f32>,
     },
+    GroupChanged { id: String },
+    GroupRemoved { id: String },
 
     /// **Synthetic** (not from the daemon): the monitor connected or
     /// reconnected. Fetch fresh state with `get_state()` when you see this —
@@ -81,6 +83,8 @@ impl ClientEvent {
                 echo_cancellation: field("echo_cancellation").and_then(Value::as_bool).unwrap_or(false),
                 agc: field("agc").and_then(Value::as_bool).unwrap_or(false),
             },
+            "GroupChanged" => ClientEvent::GroupChanged { id: as_str("id")? },
+            "GroupRemoved" => ClientEvent::GroupRemoved { id: as_str("id")? },
             "EffectsChanged" => ClientEvent::EffectsChanged {
                 device: as_str("device")?,
                 enabled: field("enabled").and_then(Value::as_bool)?,
