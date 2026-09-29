@@ -26,6 +26,16 @@ pub struct Settings {
     pub mic_agc: bool,
     pub devices: std::collections::HashMap<String, DeviceSettings>,
     pub routing: RoutingMemory,
+    /// Speaker groups (synchronized multi-device targets) — reuses
+    /// `crate::groups::SpeakerGroup` directly rather than a parallel
+    /// persisted-data type, since it's already plain data with no live
+    /// state (unlike `PersistedEffects`, which snapshots `EffectsChain`'s
+    /// running filter state into something serializable).
+    pub groups: std::collections::HashMap<String, crate::groups::SpeakerGroup>,
+    /// Effects chain per speaker group id (a group has its own chain,
+    /// applied once before fan-out). Kept separate from `devices` so a
+    /// group id never masquerades as a device entry.
+    pub group_effects: std::collections::HashMap<String, PersistedEffects>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
